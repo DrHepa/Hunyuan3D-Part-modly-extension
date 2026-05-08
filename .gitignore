@@ -1,0 +1,89 @@
+# Local agent / editor configuration
+opencode.json
+.atl/
+openspec/
+
+# Secrets and local environment files
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Python packaging/build outputs
+build/
+dist/
+*.egg-info/
+*.whl
+*.so
+*.o
+*.a
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Modly/runtime local state
+.runtime/
+.modly/
+.modly-setup-summary.json
+.upstream/
+.cache/
+models/
+artifacts/
+logs/
+outputs/
+workspace/
+Workflows/
+Default/
+
+# Large model weights and generated ML artifacts
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+*.gguf
+*.npy
+*.npz
+
+# Generated mesh/model artifacts
+*.glb
+*.gltf
+*.obj
+*.ply
+*.stl
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Node/tooling caches, in case local CLIs are used
+node_modules/
+.npm/
+.pnpm-store/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

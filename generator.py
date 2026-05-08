@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""Minimal Modly-loadable generator shell for Hunyuan3D-Part."""
+
+from __future__ import annotations
+
+import sys
+import os
+from pathlib import Path
+from typing import Any, Mapping
+
+ROOT = Path(__file__).resolve().parent
+SRC = ROOT / "src"
+
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+try:
+    from services.generators.base import BaseGenerator
+except ImportError:  # pragma: no cover - exercised in local tests only
+    class BaseGenerator:  # type: ignore[override]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+
+from runtime.config import evaluate_host_support, probe_torch_cuda_availability, resolve_host_facts, resolve_runtime_context
+from runtime.config import normalize_params
+from runtime.errors import RuntimeFailure, ValidationError
+from runtime.pipeline import run_pipeline_stage
+from runtime.p3_sam import build_adapter_readiness, decompose_mesh, resolve_weight_path
+from runtime.validate import validate_mesh_path
+
+
+class Hunyuan3DPartGenerator(BaseGenerator):
+    """Managed-extension generator with a fail-closed P3-SAM adapter path."""
+
+    weight_owner_id = "p3sam"
+    hf_repo = "tencent/Hunyuan3D-Part"
+    download_check = "p3sam/p3sam.safetensors"
+
+    def __init__(
+        self,
+        *args: Any,
+        project_root: str | Path | None = None,
+        runtime_context: Any | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        if getattr(self, "model_dir", None) is None and args:
+            self.model_dir = args[0]
+        if getattr(self, "outputs_dir", None) is None and len(args) > 1:
+            self.outputs_dir = args[1]
+        self.project_root = Path(project_root).resolve() if project_root else ROOT
+        self.runtime_context = runtime_context or resolve_runtime_context(project_root=self.project_root)
+        self._shell_loaded = False
+
+    def _resolved_model_dir(self) -> Path | None:
+        model_dir = getattr(self, "model_dir", None)
+        if model_dir is None:
+            return None
+        return Path(model_dir)
+
+    def _managed_venv_python(self) -> Path:
+        if os.name == "nt":
+            return self.project_root / "venv" / "Scripts" / "python.exe"
+        return self.project_root / "venv" / "bin" / "python"
+
+    def _setup_ready(self) -> bool:
+        managed_python = self._managed_venv_python().resolve()
+        current_python = Path(sys.executable).resolve()
+        return managed_python.exists() or current_python == managed_python
+
+    def _weight_path(self) -> Path:
+        model_dir = self._resolved_model_dir()
+        if model_dir is not None:
+            return resolve_weight_path(model_dir)
+        return resolve_weight_path(self.runtime_context.paths.model_root)
+
+    def _effective_host_support(self) -> dict[str, object]:
+        host_support = self.runtime_context.support.to_dict()
+        failure = host_support.get("failure") if isinstance(host_support, dict) else None
+        if not isinstance(failure, dict) or failure.get("code") != "cuda_not_visible":
+            return host_support
+        cuda_available = probe_torch_cuda_availability()
+        if cuda_available is not True:
+            return host_support
+
+        dependency_map = dict(self.runtime_context.support.dependencies)
+        refreshed_support = evaluate_host_support(
+            resolve_host_facts(torch_cuda_probe=lambda: cuda_available),
+            dependency_checker=lambda module: object() if dependency_map.get(module, False) else None,
+        ).to_dict()
+        refreshed_support["dependencies"] = dependency_map
+        refreshed_support["source"] = "current_process_torch"
+        return refreshed_support
+
+    def _contract_machine_code(
+        self,
+        *,
+        ok: bool,
+        host_support: Mapping[str, object],
+        setup: Mapping[str, object],
+        runtime_adapter: Mapping[str, object],
+        weights: Mapping[str, object],
+    ) -> str:
+        if ok:
+            return "ready"
+        if not bool(host_support.get("ready", False)):
+            return "runtime_unavailable"
+        if not bool(setup.get("ready", False)):
+            return "setup_pending"
+        if not bool(weights.get("ready", False)):
+            return "setup_pending"
+        if not bool(runtime_adapter.get("ready", False)):
+            return "runtime_unavailable"
+        return "runtime_unavailable"
+
+    def _contract_reason(self, blockers: list[dict[str, object]]) -> str | None:
+        if not blockers:
+            return None
+        blocker = blockers[0]
+        failure = blocker.get("failure")
+        if isinstance(failure, Mapping) and failure.get("message"):
+            return str(failure["message"])
+        if blocker.get("component") == "weights" and blocker.get("path"):
+            return f"Missing required model weights: {blocker['path']}"
+        if blocker.get("message"):
+            return str(blocker["message"])
+        if blocker.get("status"):
+            return f"{blocker['component']} status={blocker['status']}"
+        return f"{blocker['component']} is not ready"
+
+    def is_downloaded(self) -> bool:
+        return self._weight_path().is_file()
+
+    def readiness_status(self) -> dict[str, object]:
+        host_support = self._effective_host_support()
+        weights_ready = self.is_downloaded()
+        model_dir = self._resolved_model_dir()
+        setup_ready = self._setup_ready()
+        adapter_readiness = build_adapter_readiness(
+            project_root=self.project_root,
+            managed_python=self._managed_venv_python(),
+            model_root=model_dir if model_dir is not None else self.runtime_context.paths.model_root,
+        )
+        adapter_ready = bool(adapter_readiness.ready and setup_ready)
+        setup_status = {
+            "ready": setup_ready,
+            "status": "prepared_shell",
+            "owner": "electron",
+            "prepared_shell": True,
+            "message": (
+                "Shell is prepared and the managed extension venv is available."
+                if setup_ready
+                else "Shell is prepared, but the managed extension venv is not available yet."
+            ),
+            "model_dir": str(model_dir) if model_dir is not None else None,
+            "venv_python": str(self._managed_venv_python()),
+        }
+        weights_status = {
+            "ready": weights_ready,
+            "status": "downloaded" if weights_ready else "missing",
+            "hf_repo": self.hf_repo,
+            "download_check": self.download_check,
+            "weight_owner_id": self.weight_owner_id,
+            "model_dir": str(model_dir) if model_dir is not None else None,
+            "path": str(self._weight_path()),
+        }
+        readiness = {
+            "generator_class": self.__class__.__name__,
+            "surface_owner": "electron",
+            "headless_eligible": False,
+            "shell_ready": True,
+            "execution_ready": adapter_ready,
+            "inference_ready": adapter_ready,
+            "host_support": host_support,
+            "setup": setup_status,
+            "runtime_adapter": adapter_readiness.to_dict(),
+            "weights": weights_status,
+        }
+        blockers = self._collect_runtime_blockers(readiness)
+        ok = bool(readiness["execution_ready"] and readiness["inference_ready"] and not blockers)
+        machine_code = self._contract_machine_code(
+            ok=ok,
+            host_support=host_support,
+            setup=setup_status,
+            runtime_adapter=readiness["runtime_adapter"],
+            weights=weights_status,
+        )
+        readiness.update(
+            {
+                "ok": ok,
+                "machine_code": machine_code,
+                "label_hint": "Ready" if ok else ("Setup pending" if machine_code == "setup_pending" else "Runtime unavailable"),
+                "reason": self._contract_reason(blockers),
+                "details": {
+                    "blocker_count": len(blockers),
+                    "host_support_ready": bool(host_support.get("ready", False)),
+                    "setup_ready": setup_ready,
+                    "adapter_ready": bool(readiness["runtime_adapter"].get("ready", False)),
+                    "weights_ready": weights_ready,
+                    "model_dir": str(model_dir) if model_dir is not None else None,
+                    "venv_python": str(self._managed_venv_python()),
+                },
+                "blockers": blockers,
+            }
+        )
+        return readiness
+
+    def _collect_runtime_blockers(self, readiness: Mapping[str, object]) -> list[dict[str, object]]:
+        blockers: list[dict[str, object]] = []
+        host_support = readiness["host_support"]
+        if isinstance(host_support, Mapping) and not bool(host_support.get("ready", False)):
+            blocker = {"component": "host_support", **dict(host_support)}
+            blockers.append(blocker)
+        for key in ("setup", "runtime_adapter", "weights"):
+            section = readiness[key]
+            if isinstance(section, Mapping) and not bool(section.get("ready", False)):
+                if key == "setup" and section.get("status") == "prepared_shell":
+                    continue
+                blockers.append({"component": key, **dict(section)})
+        return blockers
+
+    def _emit_progress(
+        self,
+        progress_cb: Any | None,
+        *,
+        stage: str,
+        percent: int,
+        message: str,
+    ) -> None:
+        if progress_cb is None:
+            return
+        payload = {"stage": stage, "percent": percent, "message": message}
+        try:
+            progress_cb(percent, message)
+        except TypeError:
+            try:
+                progress_cb(stage, percent, message)
+            except TypeError:
+                progress_cb(payload)
+
+    def _normalize_generate_params(
+        self,
+        image_bytes: object,
+        params: Mapping[str, object] | None,
+        kwargs: Mapping[str, object],
+    ) -> tuple[object, dict[str, object]]:
+        resolved_image = image_bytes
+        resolved_params: dict[str, object] = {}
+        if isinstance(image_bytes, Mapping) and params is None:
+            resolved_params.update(dict(image_bytes))
+            resolved_image = None
+        if params:
+            resolved_params.update(dict(params))
+        if kwargs:
+            resolved_params.update(dict(kwargs))
+        return resolved_image, resolved_params
+
+    def load(self) -> "Hunyuan3DPartGenerator":
+        self._shell_loaded = True
+        return self
+
+    def _mesh_search_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        seen: set[Path] = set()
+
+        def add_root(candidate: object) -> None:
+            if candidate is None:
+                return
+            path = Path(candidate)
+            if path in seen:
+                return
+            seen.add(path)
+            roots.append(path)
+
+        outputs_dir = getattr(self, "outputs_dir", None)
+        if outputs_dir is not None:
+            output_path = Path(outputs_dir)
+            add_root(output_path)
+            add_root(output_path.parent)
+
+        workspace_dir = os.environ.get("WORKSPACE_DIR")
+        if workspace_dir:
+            add_root(workspace_dir)
+
+        return roots
+
+    def generate(
+        self,
+        image_bytes: object = None,
+        params: Mapping[str, object] | None = None,
+        progress_cb: Any | None = None,
+        cancel_event: Any | None = None,
+        **kwargs: Any,
+    ) -> dict[str, object]:
+        self.load()
+        self._emit_progress(
+            progress_cb,
+            stage="shell",
+            percent=5,
+            message="Generator shell prepared; validating mesh input and runtime readiness.",
+        )
+
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            raise RuntimeFailure(
+                "Generation cancelled before runtime validation completed.",
+                code="generation_cancelled",
+            )
+
+        resolved_image, resolved_params = self._normalize_generate_params(image_bytes, params, kwargs)
+        mesh_path = resolved_params.get("mesh_path")
+        if mesh_path is None:
+            raise ValidationError(
+                "The required secondary mesh input must be provided as params.mesh_path.",
+                code="missing_mesh_input",
+                details={"required_param": "mesh_path"},
+            )
+
+        validated_mesh = validate_mesh_path(mesh_path, search_roots=self._mesh_search_roots())
+        normalized_params = normalize_params(resolved_params)
+        readiness = self.readiness_status()
+        blockers = self._collect_runtime_blockers(readiness)
+
+        self._emit_progress(
+            progress_cb,
+            stage="readiness",
+            percent=15,
+            message="Runtime shell validated inputs and collected execution blockers.",
+        )
+
+        if blockers:
+            raise RuntimeFailure(
+                "Inference is intentionally fail-closed until host support, managed setup, runtime adapter, and weights are all ready.",
+                code="runtime_unavailable",
+                details={
+                    "blockers": blockers,
+                    "host_support": readiness["host_support"],
+                    "mesh_path": str(validated_mesh.mesh_path),
+                    "mesh_format": validated_mesh.mesh_format,
+                    "params": normalized_params.to_dict(),
+                    "image_input_present": resolved_image is not None,
+                    "shell_loaded": self._shell_loaded,
+                },
+            )
+        output_root = Path(getattr(self, "outputs_dir", None) or self.runtime_context.paths.artifacts_root)
+        result = decompose_mesh(
+            {"mesh": validated_mesh.mesh_path},
+            resolved_params,
+            output_dir=output_root,
+            runtime_context=self.runtime_context,
+            project_root=self.project_root,
+            runtime_adapter=lambda plan: run_pipeline_stage(
+                plan,
+                project_root=self.project_root,
+                managed_python=self._managed_venv_python(),
+                model_root=self._resolved_model_dir() or self.runtime_context.paths.model_root,
+                output_dir=output_root,
+            ),
+        )
+        if isinstance(result, Mapping) and result.get("primary_mesh"):
+            return str(result["primary_mesh"])
+        return result
+
+    def __call__(self, *args: Any, **kwargs: Any) -> object:
+        return self.generate(*args, **kwargs)

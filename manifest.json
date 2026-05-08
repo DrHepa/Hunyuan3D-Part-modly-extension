@@ -1,0 +1,216 @@
+{
+  "id": "hunyuan3d-part",
+  "name": "Hunyuan3D-Part",
+  "author": "DrHepa",
+  "source": "https://github.com/DrHepa/Hunyuan3D-Part-modly-extension",
+  "version": "0.1.0",
+  "type": "model",
+  "bucket": "model-managed-setup",
+  "vram_gb": 24,
+  "generator_class": "Hunyuan3DPartGenerator",
+    "description": "Experimental Modly model adapter for mesh-guided P3-SAM part decomposition.",
+  "planned_identity": {
+    "id": "hunyuan3d-part",
+    "type": "model",
+    "bucket": "model-managed-setup"
+  },
+  "live_identity": {
+    "status": "unconfirmed"
+  },
+  "metadata": {
+    "resolution": "host-compat",
+      "implementation_profile": "model-managed-generator-adapter",
+    "setup_contract": "python-root-setup-py",
+    "support_state": "experimental",
+    "surface_owner": "electron",
+    "headless_eligible": false,
+    "linux_arm64_risk": "elevated",
+    "plan_only": false,
+    "runtime_shell_ready": true,
+      "runtime_adapter_pending": false,
+    "fastapi_role": "backend-readiness-only",
+    "hf_repo": "tencent/Hunyuan3D-Part",
+    "download_check": "p3sam/p3sam.safetensors",
+    "weight_owner_id": "p3sam",
+    "workflow_constraint": "Primary workflow input must remain image or text; mesh is exposed as a required secondary named input."
+  },
+  "setup": {
+    "kind": "python-root-setup-py",
+    "entry": "setup.py",
+    "owner": "electron",
+    "install_behavior": "explicit-managed-setup"
+  },
+  "execution": {
+    "surface_owner": "electron",
+    "headless_eligible": false,
+    "workflow_orchestration": "electron",
+    "backend_readiness": "fastapi"
+  },
+  "nodes": [
+    {
+      "id": "decompose-mesh",
+      "name": "Decompose Mesh",
+      "label": "Decompose Mesh",
+      "input": "image",
+      "output": "mesh",
+      "hf_repo": "tencent/Hunyuan3D-Part",
+      "download_check": "p3sam/p3sam.safetensors",
+      "weight_owner_id": "p3sam",
+      "input_mode": "image-conditioned-mesh",
+      "inputs": [
+        {
+          "name": "front",
+          "type": "image",
+          "required": false,
+          "formats": [
+            "png",
+            "jpg",
+            "jpeg",
+            "webp"
+          ]
+        },
+        {
+          "name": "mesh",
+          "type": "mesh",
+          "required": true,
+          "formats": [
+            "glb",
+            "obj",
+            "stl",
+            "ply"
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "mesh",
+          "type": "mesh",
+          "primary": true,
+          "formats": [
+            "glb"
+          ]
+        }
+      ],
+      "sidecars": [
+        "parts/",
+        "segmentation.json",
+        "bboxes.json",
+        "completion.json",
+        "bundle_manifest.json"
+      ],
+      "params_schema": [
+        {
+          "id": "pipeline_stage",
+          "label": "Pipeline Stage",
+          "type": "select",
+          "default": "p3-sam",
+          "options": [
+            { "value": "p3-sam", "label": "P3-SAM Segmentation" },
+            { "value": "x-part", "label": "X-Part Generation" },
+            { "value": "full", "label": "Full Pipeline" }
+          ],
+          "tooltip": "All stages are backed by real runtime adapters. Full chains P3-SAM into X-Part using the generated AABB guidance."
+        },
+        {
+          "id": "max_parts",
+          "label": "Max Parts",
+          "type": "int",
+          "default": 32,
+          "min": 1,
+          "max": 512,
+          "tooltip": "Hard runtime cap for effective geometric parts in P3-SAM, X-Part, and full. P3-SAM is post-filtered by face count; X-Part trims AABB guidance before diffusion. These parts are geometric decomposition, not semantic labels."
+        },
+        {
+          "id": "output_mode",
+          "label": "Output Mode",
+          "type": "select",
+          "default": "primary",
+          "options": [
+            { "value": "primary", "label": "Primary mesh only" },
+            { "value": "analysis", "label": "Primary mesh + analysis metadata" },
+            { "value": "debug", "label": "Primary mesh + debug part GLBs" }
+          ],
+          "tooltip": "primary exposes one UI/downstream mesh; analysis keeps one mesh plus segmentation/bbox/completion metadata; debug additionally exposes per-part GLB sidecars. Current parts are geometric decomposition, not semantic garment/body/hair labels."
+        },
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": 42,
+          "min": 0,
+          "max": 2147483647,
+          "tooltip": "Deterministic seed forwarded to the upstream P3-SAM runtime."
+        },
+        {
+          "id": "export_format",
+          "label": "Export Format",
+          "type": "select",
+          "default": "glb",
+          "options": [
+            { "value": "glb", "label": "GLB" }
+          ],
+          "tooltip": "Primary mesh output format. GLB keeps Modly routing safest."
+        },
+        {
+          "id": "quality_preset",
+          "label": "Quality Preset",
+          "type": "select",
+          "default": "balanced",
+          "options": [
+            { "value": "fast", "label": "Fast" },
+            { "value": "balanced", "label": "Balanced" },
+            { "value": "quality", "label": "Quality" }
+          ],
+          "tooltip": "Controls explicit X-Part GPU execution knobs: diffusion steps, octree resolution, marching-cubes chunk size, and bf16/fp16 CUDA placement."
+        }
+      ],
+      "params": {
+        "pipeline_stage": {
+          "type": "string",
+          "enum": [
+            "p3-sam",
+            "x-part",
+            "full"
+          ],
+          "default": "p3-sam"
+        },
+        "max_parts": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "export_format": {
+          "type": "string",
+          "enum": [
+            "glb"
+          ],
+          "default": "glb"
+        },
+        "output_mode": {
+          "type": "string",
+          "enum": [
+            "primary",
+            "analysis",
+            "debug"
+          ],
+          "default": "primary"
+        },
+        "quality_preset": {
+          "type": "string"
+        }
+      },
+      "defaults": {
+        "pipeline_stage": "p3-sam",
+        "export_format": "glb",
+        "output_mode": "primary"
+      },
+        "non_goals": [
+          "multi-mesh primary routing",
+          "headless execution",
+          "install/build/release actions from local runtime"
+        ]
+    }
+  ]
+}
