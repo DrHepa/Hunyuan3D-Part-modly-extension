@@ -22,6 +22,7 @@ from runtime.config import (
     MAX_PARTS_HARD_CAP,
     HostFacts,
     SUPPORTED_EXPORT_FORMATS,
+    SUPPORTED_SEMANTIC_RESOLVERS,
     SUPPORTED_OUTPUT_MODES,
     infer_model_root,
     normalize_params,
@@ -185,6 +186,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(plan.params.export_format, "glb")
         self.assertEqual(plan.params.max_parts, DEFAULT_MAX_PARTS)
         self.assertEqual(plan.params.quality_preset, "balanced")
+        self.assertEqual(plan.params.semantic_resolver, "off")
 
     def test_supported_export_formats_are_glb_only(self) -> None:
         self.assertEqual(SUPPORTED_EXPORT_FORMATS, ("glb",))
@@ -201,6 +203,27 @@ class RuntimeContractTests(unittest.TestCase):
             normalize_params({"output_mode": "semantic"})
 
         self.assertEqual(ctx.exception.code, "invalid_output_mode")
+
+    def test_semantic_resolver_defaults_normalizes_analysis_and_rejects_guided(self) -> None:
+        self.assertEqual(SUPPORTED_SEMANTIC_RESOLVERS, ("off", "analysis"))
+
+        defaults = normalize_params()
+        self.assertEqual(defaults.semantic_resolver, "off")
+        self.assertEqual(defaults.to_dict()["semantic_resolver"], "off")
+
+        analysis = normalize_params({"semantic_resolver": " ANALYSIS "})
+        self.assertEqual(analysis.semantic_resolver, "analysis")
+        self.assertEqual(analysis.to_dict()["semantic_resolver"], "analysis")
+
+        for observed in ("guided", "foo"):
+            with self.subTest(observed=observed):
+                with self.assertRaises(ValidationError) as ctx:
+                    normalize_params({"semantic_resolver": observed})
+
+                self.assertEqual(ctx.exception.code, "invalid_semantic_resolver")
+                self.assertEqual(ctx.exception.details["allowed"], ["off", "analysis"])
+                self.assertEqual(ctx.exception.details["observed"], observed)
+                self.assertNotIn("guided", ctx.exception.details["allowed"])
 
     def test_real_stages_build_execution_plans_without_deferred_rejection(self) -> None:
         for stage in ("x-part", "full"):
@@ -1131,6 +1154,159 @@ class RuntimeContractTests(unittest.TestCase):
         p3_mock.assert_called_once()
         self.assertEqual(x_part_mock.call_args.kwargs["aabb_path"], aabb_path)
 
+    def test_p3_sam_stage_analysis_attaches_semantic_report_after_effective_artifacts(self) -> None:
+        plan = build_execution_plan(
+            {"mesh": self.mesh},
+            {"pipeline_stage": "p3-sam", "semantic_resolver": "analysis", "max_parts": 1},
+            runtime_context=self.ready_context,
+        )
+        effective_aabb_path = self.workspace / "p3" / "auto_mask_mesh_final_aabb_effective.npy"
+        effective_aabb_path.parent.mkdir(parents=True, exist_ok=True)
+        effective_aabb_path.write_bytes(b"effective")
+        p3_artifacts = DecompositionArtifacts(
+            primary_mesh_path=self.mesh,
+            parts=(),
+            segmentation={
+                "source": "p3-sam",
+                "raw_part_count": 3,
+                "effective_part_count": 1,
+                "max_parts": 1,
+                "selection_policy": "face_count_desc",
+                "effective_parts": [{"part_id": 0, "raw_part_id": 2, "face_count": 42}],
+            },
+            bboxes={"source": "p3-sam", "parts": [{"part_id": "part-0", "raw_part_id": 2, "min": [0, 0, 0], "max": [1, 1, 1]}]},
+            completion={"status": "completed"},
+            metadata={"effective_aabb_path": str(effective_aabb_path)},
+        )
+
+        with mock.patch("runtime.pipeline.run_upstream_p3_sam", return_value=p3_artifacts):
+            result = run_pipeline_stage(
+                plan,
+                project_root=self.workspace,
+                managed_python=self.workspace / "venv" / "bin" / "python",
+                model_root=self.workspace / "models",
+                output_dir=self.workspace / "p3-out",
+            )
+
+        report = result.metadata["semantic_report"]
+        self.assertEqual(report["stage"], "p3-sam")
+        self.assertEqual(report["raw_part_count"], 3)
+        self.assertEqual(report["effective_part_count"], 1)
+        self.assertEqual(report["inputs"]["effective_aabb_path"], str(effective_aabb_path))
+
+    def test_p3_sam_stage_off_does_not_attach_semantic_report(self) -> None:
+        plan = build_execution_plan(
+            {"mesh": self.mesh},
+            {"pipeline_stage": "p3-sam", "semantic_resolver": "off"},
+            runtime_context=self.ready_context,
+        )
+        p3_artifacts = DecompositionArtifacts(
+            primary_mesh_path=self.mesh,
+            parts=(),
+            segmentation={"source": "p3-sam"},
+            bboxes={"parts": []},
+            completion={"status": "completed"},
+            metadata={"source": "unit-test"},
+        )
+
+        with mock.patch("runtime.pipeline.run_upstream_p3_sam", return_value=p3_artifacts):
+            result = run_pipeline_stage(
+                plan,
+                project_root=self.workspace,
+                managed_python=self.workspace / "venv" / "bin" / "python",
+                model_root=self.workspace / "models",
+                output_dir=self.workspace / "p3-off-out",
+            )
+
+        self.assertIs(result, p3_artifacts)
+        self.assertNotIn("semantic_report", result.metadata)
+
+    def test_full_stage_analysis_preserves_same_x_part_aabb_path_as_off(self) -> None:
+        raw_aabb_path = self.workspace / "chain-analysis" / "auto_mask_mesh_final_aabb.npy"
+        effective_aabb_path = self.workspace / "chain-analysis" / "auto_mask_mesh_final_aabb_effective.npy"
+        raw_aabb_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_aabb_path.write_bytes(b"raw")
+        effective_aabb_path.write_bytes(b"effective")
+        p3_artifacts = DecompositionArtifacts(
+            primary_mesh_path=self.mesh,
+            parts=(),
+            segmentation={
+                "source": "p3-sam",
+                "raw_part_count": 2,
+                "effective_part_count": 1,
+                "selection_policy": "face_count_desc",
+                "effective_parts": [{"part_id": 0, "raw_part_id": 1, "face_count": 7}],
+            },
+            bboxes={"parts": [{"part_id": "part-0", "raw_part_id": 1, "min": [0, 0, 0], "max": [1, 1, 1]}]},
+            completion={"status": "completed"},
+            metadata={"aabb_path": str(raw_aabb_path), "effective_aabb_path": str(effective_aabb_path)},
+        )
+        x_part_artifacts = DecompositionArtifacts(
+            primary_mesh_path=self.mesh,
+            parts=(),
+            segmentation={"source": "x-part"},
+            bboxes={"parts": []},
+            completion={"status": "completed"},
+            metadata={"adapter": "x-part"},
+        )
+        observed_paths: list[Path | None] = []
+
+        for resolver in ("off", "analysis"):
+            plan = build_execution_plan(
+                {"mesh": self.mesh},
+                {"pipeline_stage": "full", "semantic_resolver": resolver},
+                runtime_context=self.ready_context,
+            )
+            with (
+                mock.patch("runtime.pipeline.run_upstream_p3_sam", return_value=p3_artifacts),
+                mock.patch("runtime.pipeline.run_upstream_x_part", return_value=x_part_artifacts) as x_part_mock,
+            ):
+                result = run_pipeline_stage(
+                    plan,
+                    project_root=self.workspace,
+                    managed_python=self.workspace / "venv" / "bin" / "python",
+                    model_root=self.workspace / "models",
+                    output_dir=self.workspace / f"full-{resolver}",
+                )
+            observed_paths.append(x_part_mock.call_args.kwargs["aabb_path"])
+            if resolver == "analysis":
+                self.assertEqual(result.metadata["semantic_report"]["stage"], "full")
+
+        self.assertEqual(observed_paths, [effective_aabb_path, effective_aabb_path])
+
+    def test_x_part_stage_analysis_attaches_aabb_only_fallback_without_changing_execution(self) -> None:
+        import numpy as np
+
+        aabb_path = self.workspace / "external-aabb.npy"
+        np.save(aabb_path, np.array([[[0, 0, 0], [1, 1, 1]]], dtype=float))
+        plan = build_execution_plan(
+            {"mesh": self.mesh},
+            {"pipeline_stage": "x-part", "semantic_resolver": "analysis", "aabb_path": str(aabb_path)},
+            runtime_context=self.ready_context,
+        )
+        x_part_artifacts = DecompositionArtifacts(
+            primary_mesh_path=self.mesh,
+            parts=(),
+            segmentation={"source": "x-part"},
+            bboxes={"parts": []},
+            completion={"status": "completed"},
+            metadata={"adapter": "x-part"},
+        )
+
+        with mock.patch("runtime.pipeline.run_upstream_x_part", return_value=x_part_artifacts) as x_part_mock:
+            result = run_pipeline_stage(
+                plan,
+                project_root=self.workspace,
+                managed_python=self.workspace / "venv" / "bin" / "python",
+                model_root=self.workspace / "models",
+                output_dir=self.workspace / "xpart-analysis-out",
+            )
+
+        self.assertEqual(x_part_mock.call_args.kwargs["aabb_path"], aabb_path)
+        report = result.metadata["semantic_report"]
+        self.assertEqual(report["stage"], "x-part")
+        self.assertIn("aabb_only_semantic_report_limited", report["warnings"])
+
     def test_full_stage_prefers_effective_p3_sam_aabb_when_present(self) -> None:
         raw_aabb_path = self.workspace / "chain" / "auto_mask_mesh_final_aabb.npy"
         effective_aabb_path = self.workspace / "chain" / "auto_mask_mesh_final_aabb_effective.npy"
@@ -1345,6 +1521,45 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(result["parts"], [])
         self.assertEqual(bundle["sidecars"]["parts"], [])
         self.assertFalse((self.workspace / "out" / "parts").exists())
+
+    def test_export_bundle_writes_semantic_report_sidecar_and_observability_without_changing_primary(self) -> None:
+        semantic_report = {
+            "schema": "hunyuan3d.semantic_report.v1",
+            "mode": "analysis",
+            "stage": "p3-sam",
+            "semantic": False,
+            "publishable": False,
+            "effective_part_count": 1,
+            "confidence": {"aggregate": 0.2, "level": "low", "publishable": False},
+            "warnings": ["insufficient_parts_for_regional_inference"],
+        }
+
+        def fake_adapter(_plan):
+            return DecompositionArtifacts(
+                primary_mesh_path=self.mesh,
+                parts=(),
+                segmentation={"source": "p3-sam", "semantic": False},
+                bboxes={"parts": []},
+                completion={"status": "completed"},
+                metadata={"source": "unit-test", "semantic_report": semantic_report},
+            )
+
+        result = decompose_mesh(
+            {"mesh": self.mesh},
+            {"semantic_resolver": "analysis", "output_mode": "primary"},
+            output_dir=self.workspace / "out-semantic",
+            runtime_adapter=fake_adapter,
+            runtime_context=self.ready_context,
+        )
+
+        bundle = json.loads(Path(result["bundle_manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(result["primary_mesh"], str(self.workspace / "out-semantic" / Path(result["primary_mesh"]).name))
+        self.assertEqual(result["semantic_report"], str(self.workspace / "out-semantic" / "semantic_report.json"))
+        self.assertTrue(Path(result["semantic_report"]).is_file())
+        self.assertEqual(bundle["sidecars"]["semantic_report"], "semantic_report.json")
+        self.assertEqual(bundle["observability"]["artifact_paths"]["semantic_report"], "semantic_report.json")
+        self.assertEqual(bundle["observability"]["artifact_paths"]["semantic_summary"]["effective_part_count"], 1)
+        self.assertEqual(result["parts"], [])
 
     def test_export_bundle_analysis_keeps_metadata_but_not_part_glbs(self) -> None:
         def fake_adapter(_plan):

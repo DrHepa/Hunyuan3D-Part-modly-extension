@@ -62,14 +62,36 @@ class ManifestContractTests(unittest.TestCase):
         self.assertEqual(len(node["outputs"]), 1)
         self.assertTrue(node["outputs"][0]["primary"])
         self.assertEqual(node["outputs"][0]["formats"], ["glb"])
-        self.assertEqual(node["defaults"], {"pipeline_stage": "p3-sam", "export_format": "glb", "output_mode": "primary"})
+        self.assertEqual(
+            node["defaults"],
+            {
+                "pipeline_stage": "p3-sam",
+                "export_format": "glb",
+                "output_mode": "primary",
+                "semantic_resolver": "off",
+            },
+        )
         self.assertEqual(
             sorted(item["id"] for item in node["params_schema"]),
-            ["export_format", "max_parts", "output_mode", "pipeline_stage", "quality_preset", "seed"],
+            [
+                "export_format",
+                "max_parts",
+                "output_mode",
+                "pipeline_stage",
+                "quality_preset",
+                "seed",
+                "semantic_resolver",
+            ],
         )
         export_param = next(item for item in node["params_schema"] if item["id"] == "export_format")
         self.assertEqual(export_param["options"], [{"value": "glb", "label": "GLB"}])
         self.assertEqual(node["params"]["export_format"]["enum"], ["glb"])
+
+    def test_semantic_report_sidecar_is_statically_discoverable(self) -> None:
+        node = self.manifest["nodes"][0]
+
+        self.assertIn("sidecars", node)
+        self.assertIn("semantic_report.json", node["sidecars"])
 
     def test_output_mode_manifest_contract_exposes_visibility_modes(self) -> None:
         node = self.manifest["nodes"][0]
@@ -90,6 +112,29 @@ class ManifestContractTests(unittest.TestCase):
         self.assertIn("not semantic", output_mode["tooltip"])
         self.assertEqual(node["params"]["output_mode"]["enum"], ["primary", "analysis", "debug"])
         self.assertEqual(node["params"]["output_mode"]["default"], "primary")
+
+    def test_semantic_resolver_manifest_contract_is_diagnostic_only_without_guided(self) -> None:
+        node = self.manifest["nodes"][0]
+        semantic_resolver = next(item for item in node["params_schema"] if item["id"] == "semantic_resolver")
+
+        self.assertEqual(semantic_resolver["default"], "off")
+        self.assertEqual(
+            semantic_resolver["options"],
+            [
+                {"value": "off", "label": "Off"},
+                {"value": "analysis", "label": "Analysis report only"},
+            ],
+        )
+        self.assertIn("off keeps current behavior unchanged", semantic_resolver["tooltip"])
+        self.assertIn("writes no semantic report", semantic_resolver["tooltip"])
+        self.assertIn("analysis writes diagnostic semantic_report.json only", semantic_resolver["tooltip"])
+        self.assertIn("does not alter generation", semantic_resolver["tooltip"])
+        self.assertIn("X-Part inputs", semantic_resolver["tooltip"])
+        self.assertIn("Guided semantic decomposition is reserved", semantic_resolver["tooltip"])
+        self.assertNotIn("guided", [item["value"] for item in semantic_resolver["options"]])
+        self.assertEqual(node["params"]["semantic_resolver"]["enum"], ["off", "analysis"])
+        self.assertEqual(node["params"]["semantic_resolver"]["default"], "off")
+        self.assertNotIn("guided", node["params"]["semantic_resolver"]["enum"])
 
     def test_x_part_resource_params_are_documented_as_real_gpu_knobs(self) -> None:
         node = self.manifest["nodes"][0]

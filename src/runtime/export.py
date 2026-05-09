@@ -38,6 +38,43 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _semantic_report_summary(report: dict[str, Any]) -> dict[str, Any]:
+    confidence = report.get("confidence") if isinstance(report.get("confidence"), dict) else {}
+    return {
+        "schema": report.get("schema"),
+        "mode": report.get("mode"),
+        "stage": report.get("stage"),
+        "semantic": report.get("semantic"),
+        "publishable": report.get("publishable"),
+        "effective_part_count": report.get("effective_part_count"),
+        "confidence": {
+            "aggregate": confidence.get("aggregate"),
+            "level": confidence.get("level"),
+        },
+        "warnings": list(report.get("warnings", [])[:5]) if isinstance(report.get("warnings"), list) else [],
+    }
+
+
+def _write_semantic_report_sidecar(*, output_dir: Path, metadata: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    semantic_report = metadata.get("semantic_report")
+    if semantic_report is None:
+        return None, None
+    destination = output_dir / "semantic_report.json"
+    if isinstance(semantic_report, dict):
+        _write_json(destination, semantic_report)
+        return str(destination.relative_to(output_dir)), _semantic_report_summary(semantic_report)
+    source = Path(str(semantic_report))
+    if source.is_file():
+        shutil.copy2(source, destination)
+        try:
+            loaded = json.loads(destination.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            loaded = {}
+        summary = _semantic_report_summary(loaded) if isinstance(loaded, dict) else {"source": str(source)}
+        return str(destination.relative_to(output_dir)), summary
+    return None, {"warning": "semantic_report_metadata_present_but_unusable", "source": str(semantic_report)}
+
+
 def build_observability_record(
     *,
     context: RuntimeContext,
@@ -109,13 +146,20 @@ def export_bundle(
         completion_file = output_dir / "completion.json"
         _write_json(completion_file, artifacts.completion)
         completion_path = str(completion_file.relative_to(output_dir))
+    semantic_report_path, semantic_report_summary = _write_semantic_report_sidecar(
+        output_dir=output_dir,
+        metadata=artifacts.metadata,
+    )
     artifact_paths: dict[str, Any] = {
         "primary_mesh": str(primary_output.relative_to(output_dir)),
         "parts_dir": str(parts_dir.relative_to(output_dir)) if expose_debug_parts else None,
         "segmentation": str(segmentation_path.relative_to(output_dir)),
         "bboxes": str(bboxes_path.relative_to(output_dir)),
         "completion": completion_path,
+        "semantic_report": semantic_report_path,
     }
+    if semantic_report_summary is not None:
+        artifact_paths["semantic_summary"] = semantic_report_summary
     observability = build_observability_record(
         context=context,
         params=params,
@@ -129,6 +173,7 @@ def export_bundle(
             "segmentation": artifact_paths["segmentation"],
             "bboxes": artifact_paths["bboxes"],
             "completion": artifact_paths["completion"],
+            "semantic_report": artifact_paths["semantic_report"],
         },
         "routing_contract": {
             "primary_output_type": "mesh",
@@ -151,6 +196,7 @@ def export_bundle(
         "segmentation": str(segmentation_path),
         "bboxes": str(bboxes_path),
         "completion": str(output_dir / completion_path) if completion_path else None,
+        "semantic_report": str(output_dir / semantic_report_path) if semantic_report_path else None,
         "bundle_manifest": str(manifest_path),
         "observability": observability,
     }

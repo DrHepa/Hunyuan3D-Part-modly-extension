@@ -95,6 +95,7 @@
         "parts/",
         "segmentation.json",
         "bboxes.json",
+        "semantic_report.json",
         "completion.json",
         "bundle_manifest.json"
       ],
@@ -131,6 +132,17 @@
             { "value": "debug", "label": "Primary mesh + debug part GLBs" }
           ],
           "tooltip": "primary exposes one UI/downstream mesh; analysis keeps one mesh plus segmentation/bbox/completion metadata; debug additionally exposes per-part GLB sidecars. Current parts are geometric decomposition, not semantic garment/body/hair labels."
+        },
+        {
+          "id": "semantic_resolver",
+          "label": "Semantic Resolver",
+          "type": "select",
+          "default": "off",
+          "options": [
+            { "value": "off", "label": "Off" },
+            { "value": "analysis", "label": "Analysis report only" }
+          ],
+          "tooltip": "off keeps current behavior unchanged and writes no semantic report. analysis writes diagnostic semantic_report.json only; it does not alter generation, max_parts, output_mode, routing, or X-Part inputs. Guided semantic decomposition is reserved and not accepted in this MVP."
         },
         {
           "id": "seed",
@@ -197,6 +209,14 @@
           ],
           "default": "primary"
         },
+        "semantic_resolver": {
+          "type": "string",
+          "enum": [
+            "off",
+            "analysis"
+          ],
+          "default": "off"
+        },
         "quality_preset": {
           "type": "string"
         }
@@ -204,7 +224,8 @@
       "defaults": {
         "pipeline_stage": "p3-sam",
         "export_format": "glb",
-        "output_mode": "primary"
+        "output_mode": "primary",
+        "semantic_resolver": "off"
       },
         "non_goals": [
           "multi-mesh primary routing",

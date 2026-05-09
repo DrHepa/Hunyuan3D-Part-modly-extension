@@ -19,7 +19,13 @@ SUPPORTED_EXPORT_FORMATS = ("glb",)
 SUPPORTED_PIPELINE_STAGES = ("p3-sam", "x-part", "full")
 SUPPORTED_OUTPUT_MODES = ("primary", "analysis", "debug")
 SUPPORTED_QUALITY_PRESETS = ("fast", "balanced", "quality")
-DEFAULT_PARAMS = {"pipeline_stage": "p3-sam", "export_format": "glb", "output_mode": "primary"}
+SUPPORTED_SEMANTIC_RESOLVERS = ("off", "analysis")
+DEFAULT_PARAMS = {
+    "pipeline_stage": "p3-sam",
+    "export_format": "glb",
+    "output_mode": "primary",
+    "semantic_resolver": "off",
+}
 REQUIRED_RUNTIME_MODULES = ("numpy", "torch", "trimesh")
 MINIMUM_PYTHON = (3, 10)
 DEFAULT_MAX_PARTS = 32
@@ -99,6 +105,7 @@ class NormalizedParams:
     pipeline_stage: str
     export_format: str
     output_mode: str = "primary"
+    semantic_resolver: str = "off"
     max_parts: int | None = None
     seed: int | None = None
     quality_preset: str | None = None
@@ -109,6 +116,7 @@ class NormalizedParams:
             "pipeline_stage": self.pipeline_stage,
             "export_format": self.export_format,
             "output_mode": self.output_mode,
+            "semantic_resolver": self.semantic_resolver,
         }
         if self.max_parts is not None:
             payload["max_parts"] = self.max_parts
@@ -308,6 +316,13 @@ def normalize_params(raw_params: dict[str, object] | None = None) -> NormalizedP
             code="invalid_output_mode",
             details={"allowed": list(SUPPORTED_OUTPUT_MODES), "observed": output_mode},
         )
+    semantic_resolver = str(params["semantic_resolver"]).strip().lower()
+    if semantic_resolver not in SUPPORTED_SEMANTIC_RESOLVERS:
+        raise ValidationError(
+            "semantic_resolver must be one of the active non-mutating resolver modes; guided is reserved for a future gated workflow.",
+            code="invalid_semantic_resolver",
+            details={"allowed": list(SUPPORTED_SEMANTIC_RESOLVERS), "observed": semantic_resolver},
+        )
     max_parts = params.get("max_parts")
     if max_parts is None:
         max_parts = DEFAULT_MAX_PARTS
@@ -365,6 +380,7 @@ def normalize_params(raw_params: dict[str, object] | None = None) -> NormalizedP
         pipeline_stage=pipeline_stage,
         export_format=export_format,
         output_mode=output_mode,
+        semantic_resolver=semantic_resolver,
         max_parts=max_parts,
         seed=seed,
         quality_preset=quality_preset,
