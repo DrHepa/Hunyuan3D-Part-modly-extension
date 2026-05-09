@@ -27,6 +27,7 @@ from runtime.config import normalize_params
 from runtime.errors import RuntimeFailure, ValidationError
 from runtime.pipeline import run_pipeline_stage
 from runtime.p3_sam import build_adapter_readiness, decompose_mesh, resolve_weight_path
+from runtime.semantic_report import build_image_evidence
 from runtime.validate import validate_mesh_path
 
 
@@ -318,6 +319,7 @@ class Hunyuan3DPartGenerator(BaseGenerator):
 
         validated_mesh = validate_mesh_path(mesh_path, search_roots=self._mesh_search_roots())
         normalized_params = normalize_params(resolved_params)
+        image_evidence = build_image_evidence(resolved_image)
         readiness = self.readiness_status()
         blockers = self._collect_runtime_blockers(readiness)
 
@@ -347,6 +349,7 @@ class Hunyuan3DPartGenerator(BaseGenerator):
             {"mesh": validated_mesh.mesh_path},
             resolved_params,
             output_dir=output_root,
+            image_evidence=image_evidence,
             runtime_context=self.runtime_context,
             project_root=self.project_root,
             runtime_adapter=lambda plan: run_pipeline_stage(

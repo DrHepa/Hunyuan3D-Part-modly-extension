@@ -50,6 +50,7 @@ from runtime.p3_sam import (
     runtime_source_root,
     sonata_cache_root,
 )
+from runtime.semantic_report import build_image_evidence
 from runtime.x_part import (
     _build_subprocess_script,
     _resolve_x_part_min_available_memory_gib,
@@ -279,6 +280,7 @@ class RuntimeContractTests(unittest.TestCase):
 
     def test_dispatch_accepts_x_part_and_full_with_mocked_runtime_adapter(self) -> None:
         def fake_adapter(plan):
+            self.assertIsNone(plan.image_evidence)
             return DecompositionArtifacts(
                 primary_mesh_path=self.mesh,
                 parts=(),
@@ -298,6 +300,40 @@ class RuntimeContractTests(unittest.TestCase):
                     runtime_context=self.ready_context,
                 )
                 self.assertTrue(Path(result["primary_mesh"]).exists())
+
+    def test_execution_plan_carries_optional_image_evidence_without_validated_image_input(self) -> None:
+        image_evidence = build_image_evidence(b"not-an-image")
+        observed_plan = None
+
+        def fake_adapter(plan):
+            nonlocal observed_plan
+            observed_plan = plan
+            self.assertNotIn("image", plan.to_dict())
+            self.assertEqual(plan.image_evidence, image_evidence)
+            self.assertEqual(plan.to_dict()["image_evidence"], image_evidence)
+            return DecompositionArtifacts(
+                primary_mesh_path=self.mesh,
+                parts=(),
+                segmentation={"source": "unit-test"},
+                bboxes={"parts": []},
+                completion={"status": "completed"},
+                metadata={"adapter": "unit-test"},
+            )
+
+        result = decompose_mesh(
+            {"mesh": self.mesh},
+            output_dir=self.workspace / "out-image-evidence",
+            image_evidence=image_evidence,
+            runtime_adapter=fake_adapter,
+            runtime_context=self.ready_context,
+        )
+
+        self.assertIsNotNone(observed_plan)
+        self.assertTrue(Path(result["primary_mesh"]).exists())
+        encoded = json.dumps(observed_plan.to_dict(), sort_keys=True)
+        self.assertNotIn("not-an-image", encoded)
+        for forbidden in ("base64", "image_path", "path", "hash", "sidecar"):
+            self.assertNotIn(forbidden, encoded)
 
     def test_generator_reports_separate_shell_and_weight_readiness(self) -> None:
         generator = Hunyuan3DPartGenerator(
@@ -1159,6 +1195,7 @@ class RuntimeContractTests(unittest.TestCase):
             {"mesh": self.mesh},
             {"pipeline_stage": "p3-sam", "semantic_resolver": "analysis", "max_parts": 1},
             runtime_context=self.ready_context,
+            image_evidence=build_image_evidence(b"not-an-image"),
         )
         effective_aabb_path = self.workspace / "p3" / "auto_mask_mesh_final_aabb_effective.npy"
         effective_aabb_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1193,12 +1230,15 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(report["raw_part_count"], 3)
         self.assertEqual(report["effective_part_count"], 1)
         self.assertEqual(report["inputs"]["effective_aabb_path"], str(effective_aabb_path))
+        self.assertEqual(report["image_evidence"]["status"], "invalid")
+        self.assertEqual(report["diagnostics"]["image_evidence"]["provenance"], "execution_plan")
 
     def test_p3_sam_stage_off_does_not_attach_semantic_report(self) -> None:
         plan = build_execution_plan(
             {"mesh": self.mesh},
             {"pipeline_stage": "p3-sam", "semantic_resolver": "off"},
             runtime_context=self.ready_context,
+            image_evidence=build_image_evidence(b"not-an-image"),
         )
         p3_artifacts = DecompositionArtifacts(
             primary_mesh_path=self.mesh,
@@ -1221,7 +1261,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIs(result, p3_artifacts)
         self.assertNotIn("semantic_report", result.metadata)
 
-    def test_full_stage_analysis_preserves_same_x_part_aabb_path_as_off(self) -> None:
+    def test_full_stage_analysis_preserves_same_x_part_aabb_path_with_and_without_image_evidence(self) -> None:
         raw_aabb_path = self.workspace / "chain-analysis" / "auto_mask_mesh_final_aabb.npy"
         effective_aabb_path = self.workspace / "chain-analysis" / "auto_mask_mesh_final_aabb_effective.npy"
         raw_aabb_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1251,11 +1291,12 @@ class RuntimeContractTests(unittest.TestCase):
         )
         observed_paths: list[Path | None] = []
 
-        for resolver in ("off", "analysis"):
+        for label, image_evidence in (("without-image-evidence", None), ("with-image-evidence", build_image_evidence(b"not-an-image"))):
             plan = build_execution_plan(
                 {"mesh": self.mesh},
-                {"pipeline_stage": "full", "semantic_resolver": resolver},
+                {"pipeline_stage": "full", "semantic_resolver": "analysis"},
                 runtime_context=self.ready_context,
+                image_evidence=image_evidence,
             )
             with (
                 mock.patch("runtime.pipeline.run_upstream_p3_sam", return_value=p3_artifacts),
@@ -1266,11 +1307,12 @@ class RuntimeContractTests(unittest.TestCase):
                     project_root=self.workspace,
                     managed_python=self.workspace / "venv" / "bin" / "python",
                     model_root=self.workspace / "models",
-                    output_dir=self.workspace / f"full-{resolver}",
+                    output_dir=self.workspace / f"full-{label}",
                 )
             observed_paths.append(x_part_mock.call_args.kwargs["aabb_path"])
-            if resolver == "analysis":
-                self.assertEqual(result.metadata["semantic_report"]["stage"], "full")
+            self.assertEqual(result.metadata["semantic_report"]["stage"], "full")
+            expected_status = "invalid" if image_evidence is not None else "absent"
+            self.assertEqual(result.metadata["semantic_report"]["image_evidence"]["status"], expected_status)
 
         self.assertEqual(observed_paths, [effective_aabb_path, effective_aabb_path])
 
@@ -1283,6 +1325,7 @@ class RuntimeContractTests(unittest.TestCase):
             {"mesh": self.mesh},
             {"pipeline_stage": "x-part", "semantic_resolver": "analysis", "aabb_path": str(aabb_path)},
             runtime_context=self.ready_context,
+            image_evidence=build_image_evidence(b"not-an-image"),
         )
         x_part_artifacts = DecompositionArtifacts(
             primary_mesh_path=self.mesh,
@@ -1306,6 +1349,8 @@ class RuntimeContractTests(unittest.TestCase):
         report = result.metadata["semantic_report"]
         self.assertEqual(report["stage"], "x-part")
         self.assertIn("aabb_only_semantic_report_limited", report["warnings"])
+        self.assertEqual(report["image_evidence"]["status"], "invalid")
+        self.assertEqual(report["diagnostics"]["image_evidence"]["provenance"], "execution_plan")
 
     def test_full_stage_prefers_effective_p3_sam_aabb_when_present(self) -> None:
         raw_aabb_path = self.workspace / "chain" / "auto_mask_mesh_final_aabb.npy"
@@ -1407,6 +1452,15 @@ class RuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(result, str(self.mesh))
         decompose_mock.assert_called_once()
+        call_args, call_kwargs = decompose_mock.call_args
+        self.assertEqual(call_args[0], {"mesh": self.mesh.resolve()})
+        self.assertNotIn("image", call_args[0])
+        image_evidence = call_kwargs["image_evidence"]
+        self.assertEqual(image_evidence["image_evidence"]["status"], "invalid")
+        encoded = json.dumps(image_evidence, sort_keys=True)
+        self.assertNotIn("image-bytes", encoded)
+        for forbidden in ("base64", "image_path", "path", "hash", "sidecar"):
+            self.assertNotIn(forbidden, encoded)
 
     def test_generator_progress_callback_prefers_modly_two_arg_contract(self) -> None:
         generator = Hunyuan3DPartGenerator(
@@ -1613,7 +1667,61 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual([part["part_id"] for part in bundle["sidecars"]["parts"]], ["arm", "leg"])
         self.assertEqual(bundle["routing_contract"]["output_mode"], "debug")
         self.assertEqual(bundle["routing_contract"]["parts_visibility"], "debug_sidecars")
-        self.assertTrue((self.workspace / "out-debug" / "parts" / "arm.glb").is_file())
+        parts_dir = self.workspace / "out-debug" / bundle["observability"]["artifact_paths"]["parts_dir"]
+        self.assertEqual(parts_dir.parent, self.workspace / "out-debug" / "parts")
+        self.assertTrue((parts_dir / "arm.glb").is_file())
+        self.assertEqual(result["parts"][0]["path"], str((parts_dir / "arm.glb").relative_to(self.workspace / "out-debug")))
+
+    def test_export_bundle_debug_uses_generation_scoped_parts_dir_without_overwriting(self) -> None:
+        output_dir = self.workspace / "out-debug-rerun"
+
+        def adapter_with_part_bytes(payload: bytes):
+            def fake_adapter(_plan):
+                self.part_a.write_bytes(payload)
+                return DecompositionArtifacts(
+                    primary_mesh_path=self.mesh,
+                    parts=(
+                        PartArtifact(part_id="arm", mesh_path=self.part_a, bbox={"min": [0, 0, 0], "max": [1, 1, 1]}),
+                    ),
+                    segmentation={"source": "x-part", "semantic": False},
+                    bboxes={"parts": []},
+                    completion={"status": "completed"},
+                    metadata={"source": "unit-test"},
+                )
+
+            return fake_adapter
+
+        first_result = decompose_mesh(
+            {"mesh": self.mesh},
+            {"output_mode": "debug", "seed": 1},
+            output_dir=output_dir,
+            runtime_adapter=adapter_with_part_bytes(b"first-arm"),
+            runtime_context=self.ready_context,
+        )
+        first_bundle = json.loads(Path(first_result["bundle_manifest"]).read_text(encoding="utf-8"))
+        first_parts_dir = output_dir / first_bundle["observability"]["artifact_paths"]["parts_dir"]
+        first_arm = first_parts_dir / "arm.glb"
+
+        second_result = decompose_mesh(
+            {"mesh": self.mesh},
+            {"output_mode": "debug", "seed": 2},
+            output_dir=output_dir,
+            runtime_adapter=adapter_with_part_bytes(b"second-arm"),
+            runtime_context=self.ready_context,
+        )
+        second_bundle = json.loads(Path(second_result["bundle_manifest"]).read_text(encoding="utf-8"))
+        second_parts_dir = output_dir / second_bundle["observability"]["artifact_paths"]["parts_dir"]
+        second_arm = second_parts_dir / "arm.glb"
+
+        self.assertNotEqual(first_parts_dir, second_parts_dir)
+        self.assertEqual(first_parts_dir.parent, output_dir / "parts")
+        self.assertEqual(second_parts_dir.parent, output_dir / "parts")
+        self.assertEqual({path for path in (output_dir / "parts").iterdir() if path.is_dir()}, {first_parts_dir, second_parts_dir})
+        self.assertEqual(first_arm.read_bytes(), b"first-arm")
+        self.assertEqual(second_arm.read_bytes(), b"second-arm")
+        self.assertEqual(second_bundle["sidecars"]["parts"][0]["path"], str(second_arm.relative_to(output_dir)))
+        self.assertEqual(second_result["parts"][0]["path"], str(second_arm.relative_to(output_dir)))
+        self.assertEqual(second_bundle["observability"]["artifact_paths"]["parts_dir"], str(second_parts_dir.relative_to(output_dir)))
 
     def test_x_part_contract_does_not_expose_fake_semantic_labels(self) -> None:
         runtime_root = runtime_source_root(self.workspace)

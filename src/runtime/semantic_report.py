@@ -6,6 +6,8 @@ artifacts and never mutates segmentation, AABB, or raw face-id inputs.
 
 from __future__ import annotations
 
+from io import BytesIO
+import importlib
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -25,6 +27,221 @@ SUPPORTED_CANDIDATE_ROLES = (
     "unknown",
 )
 VERTICAL_AXIS = "z"
+
+
+def _empty_image_alpha() -> dict[str, Any]:
+    return {"present": False}
+
+
+def _base_image_evidence(*, present: bool, status: str, byte_size: int | None = None) -> dict[str, Any]:
+    image_input: dict[str, Any] = {
+        "present": present,
+        "metadata_only": True,
+        "persisted": False,
+        "decodable": status == "summarized",
+        "diagnostics": [],
+    }
+    if byte_size is not None:
+        image_input["byte_size"] = byte_size
+    return {
+        "image_input": image_input,
+        "image_evidence": {
+            "status": status,
+            "auxiliary_only": True,
+            "mutates_generation": False,
+            "mutates_xpart_inputs": False,
+            "alpha": _empty_image_alpha(),
+            "diagnostics": [],
+        },
+    }
+
+
+def _copy_image_input_section(image_input: Mapping[str, Any]) -> dict[str, Any]:
+    allowed_keys = (
+        "present",
+        "metadata_only",
+        "persisted",
+        "decodable",
+        "byte_size",
+        "format",
+        "mode",
+        "width",
+        "height",
+    )
+    copied = {key: image_input[key] for key in allowed_keys if key in image_input}
+    copied["present"] = bool(copied.get("present", False))
+    copied["metadata_only"] = bool(copied.get("metadata_only", True))
+    copied["persisted"] = bool(copied.get("persisted", False))
+    copied["diagnostics"] = [str(item) for item in image_input.get("diagnostics", []) or []]
+    return copied
+
+
+def _copy_image_evidence_section(image_evidence: Mapping[str, Any]) -> dict[str, Any]:
+    alpha = image_evidence.get("alpha") if isinstance(image_evidence.get("alpha"), Mapping) else {}
+    copied_alpha: dict[str, Any] = {"present": bool(alpha.get("present", False))}
+    for key in ("transparency_ratio", "foreground_bbox_pixel", "foreground_bbox_pixels", "foreground_bbox_normalized"):
+        if key in alpha:
+            copied_alpha[key] = alpha[key]
+
+    copied = {
+        "status": str(image_evidence.get("status") or "invalid"),
+        "auxiliary_only": bool(image_evidence.get("auxiliary_only", True)),
+        "mutates_generation": bool(image_evidence.get("mutates_generation", False)),
+        "mutates_xpart_inputs": bool(image_evidence.get("mutates_xpart_inputs", False)),
+        "alpha": copied_alpha,
+        "diagnostics": [str(item) for item in image_evidence.get("diagnostics", []) or []],
+    }
+    return copied
+
+
+def _normalize_report_image_evidence(image_evidence: Mapping[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if image_evidence is None:
+        normalized = build_image_evidence(None)
+        provenance = "default_absent"
+    elif isinstance(image_evidence, Mapping) and isinstance(image_evidence.get("image_input"), Mapping) and isinstance(
+        image_evidence.get("image_evidence"),
+        Mapping,
+    ):
+        normalized = {
+            "image_input": _copy_image_input_section(image_evidence["image_input"]),
+            "image_evidence": _copy_image_evidence_section(image_evidence["image_evidence"]),
+        }
+        provenance = "execution_plan"
+    else:
+        normalized = build_image_evidence(object())
+        diagnostic = "image_evidence_unusable"
+        normalized["image_input"]["diagnostics"] = [diagnostic]
+        normalized["image_evidence"]["diagnostics"] = [diagnostic]
+        provenance = "execution_plan_invalid"
+
+    image_input = normalized["image_input"]
+    evidence = normalized["image_evidence"]
+    status = str(evidence.get("status") or "invalid")
+    diagnostics = sorted({str(item) for item in (image_input.get("diagnostics", []) or []) + (evidence.get("diagnostics", []) or [])})
+    report_diagnostics = {
+        "status": status,
+        "present": bool(image_input.get("present", False)),
+        "provenance": provenance,
+        "metadata_only": True,
+        "auxiliary_only": True,
+        "non_authoritative": True,
+        "mutates_generation": False,
+        "mutates_xpart_inputs": False,
+        "diagnostics": diagnostics,
+    }
+    return image_input, evidence, report_diagnostics
+
+
+def _bounded_bbox_normalized(left: int, top: int, right_exclusive: int, bottom_exclusive: int, width: int, height: int) -> list[float]:
+    def clamp(value: float) -> float:
+        return min(max(value, 0.0), 1.0)
+
+    return [
+        round(clamp(left / width), 6),
+        round(clamp(top / height), 6),
+        round(clamp(right_exclusive / width), 6),
+        round(clamp(bottom_exclusive / height), 6),
+    ]
+
+
+def _alpha_evidence(image: Any) -> dict[str, Any]:
+    bands = tuple(image.getbands())
+    has_alpha = "A" in bands or image.mode in {"LA", "RGBA"}
+    alpha: dict[str, Any] = {"present": has_alpha}
+    if not has_alpha:
+        return alpha
+
+    alpha_channel = image.getchannel("A")
+    width, height = image.size
+    total_pixels = max(width * height, 1)
+    alpha_values = list(alpha_channel.getdata())
+    transparent_pixels = sum(1 for value in alpha_values if int(value) == 0)
+    alpha["transparency_ratio"] = round(transparent_pixels / total_pixels, 6)
+
+    foreground_mask = alpha_channel.point(lambda value: 255 if value > 0 else 0)
+    bbox = foreground_mask.getbbox()
+    if bbox is not None:
+        left, top, right_exclusive, bottom_exclusive = bbox
+        right_inclusive = min(max(right_exclusive - 1, left), width - 1)
+        bottom_inclusive = min(max(bottom_exclusive - 1, top), height - 1)
+        bbox_pixels = [
+            min(max(left, 0), width - 1),
+            min(max(top, 0), height - 1),
+            right_inclusive,
+            bottom_inclusive,
+        ]
+        alpha["foreground_bbox_pixels"] = bbox_pixels
+        alpha["foreground_bbox_pixel"] = bbox_pixels
+        alpha["foreground_bbox_normalized"] = _bounded_bbox_normalized(
+            left,
+            top,
+            right_exclusive,
+            bottom_exclusive,
+            width,
+            height,
+        )
+    return alpha
+
+
+def build_image_evidence(image_bytes: object) -> dict[str, Any]:
+    """Build deterministic, metadata-only evidence for optional source image bytes.
+
+    The alpha foreground threshold is intentionally simple and stable:
+    pixels with alpha > 0 are foreground, and alpha == 0 is transparent.
+    No raw bytes, base64, source paths, sidecars, or cryptographic hashes are
+    returned by this helper.
+    """
+    if image_bytes is None:
+        return _base_image_evidence(present=False, status="absent")
+
+    if isinstance(image_bytes, memoryview):
+        byte_payload = image_bytes.tobytes()
+    elif isinstance(image_bytes, bytearray):
+        byte_payload = bytes(image_bytes)
+    elif isinstance(image_bytes, bytes):
+        byte_payload = image_bytes
+    else:
+        evidence = _base_image_evidence(present=True, status="invalid")
+        diagnostic = "unsupported_image_bytes_type"
+        evidence["image_input"]["diagnostics"].append(diagnostic)
+        evidence["image_evidence"]["diagnostics"].append(diagnostic)
+        return evidence
+
+    evidence = _base_image_evidence(present=True, status="invalid", byte_size=len(byte_payload))
+    try:
+        pil_image = importlib.import_module("PIL.Image")
+    except ImportError:
+        evidence["image_input"]["decodable"] = False
+        evidence["image_evidence"]["status"] = "unavailable"
+        diagnostic = "decoder_unavailable"
+        evidence["image_input"]["diagnostics"].append(diagnostic)
+        evidence["image_evidence"]["diagnostics"].append(diagnostic)
+        return evidence
+
+    try:
+        with pil_image.open(BytesIO(byte_payload)) as image:
+            image.load()
+            image_input = evidence["image_input"]
+            image_input.update(
+                {
+                    "decodable": True,
+                    "format": image.format,
+                    "mode": image.mode,
+                    "width": int(image.width),
+                    "height": int(image.height),
+                }
+            )
+            evidence["image_evidence"].update(
+                {
+                    "status": "summarized",
+                    "alpha": _alpha_evidence(image),
+                }
+            )
+    except Exception:
+        diagnostic = "image_decode_failed"
+        evidence["image_input"]["diagnostics"].append(diagnostic)
+        evidence["image_evidence"]["diagnostics"].append(diagnostic)
+    return evidence
 
 
 def _param_value(params: NormalizedParams | Mapping[str, Any] | None, key: str, default: Any = None) -> Any:
@@ -215,6 +432,7 @@ def build_semantic_report(
     bboxes: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
     effective_aabb_path: str | Path | None = None,
+    image_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a deterministic, diagnostic-only regional semantic report."""
     segmentation = segmentation or {}
@@ -226,6 +444,7 @@ def build_semantic_report(
     raw_part_count = int(segmentation.get("raw_part_count") or len(bbox_parts))
     effective_part_count = int(segmentation.get("effective_part_count") or len(bbox_parts))
     selection_policy = str(segmentation.get("selection_policy") or "bbox_order")
+    image_input_section, image_evidence_section, image_evidence_diagnostics = _normalize_report_image_evidence(image_evidence)
 
     descriptors_by_part: list[tuple[int, Mapping[str, Any], dict[str, Any]]] = []
     warnings: list[str] = []
@@ -298,8 +517,11 @@ def build_semantic_report(
                 },
                 "raw_arrays_omitted": ["face_ids", "raw_masks"],
                 "mutates_xpart_inputs": False,
+                "image_evidence": image_evidence_diagnostics,
             },
             "warnings": warnings,
+            "image_input": image_input_section,
+            "image_evidence": image_evidence_section,
             "inputs": {
                 "segmentation": _provenance_ref(segmentation, metadata, "segmentation"),
                 "bboxes": _provenance_ref(bboxes, metadata, "bboxes"),
@@ -346,6 +568,7 @@ def _load_aabb_parts(aabb_path: Path) -> list[dict[str, Any]]:
 def build_xpart_semantic_fallback(
     params: NormalizedParams | Mapping[str, Any] | None,
     aabb_path: str | Path | None,
+    image_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build an AABB-only x-part report or deterministic unavailable warning."""
     if aabb_path is None:
@@ -355,6 +578,7 @@ def build_xpart_semantic_fallback(
             segmentation={"source": "x-part", "selection_policy": "aabb_only_unavailable"},
             bboxes={"source": "x-part", "parts": []},
             metadata={},
+            image_evidence=image_evidence,
         )
         report["warnings"].append("semantic_report_unavailable")
         report["diagnostics"]["fallback_reason"] = "missing_aabb_path"
@@ -370,6 +594,7 @@ def build_xpart_semantic_fallback(
             segmentation={"source": "x-part", "selection_policy": "aabb_only_unavailable"},
             bboxes={"source": "x-part", "parts": []},
             metadata={"aabb_path": str(resolved)},
+            image_evidence=image_evidence,
         )
         report["warnings"].extend(["semantic_report_unavailable", "aabb_only_fallback_load_failed"])
         report["diagnostics"]["fallback_reason"] = type(exc).__name__
@@ -390,6 +615,7 @@ def build_xpart_semantic_fallback(
         bboxes={"source": "x-part", "parts": effective_parts},
         metadata={"aabb_path": str(resolved)},
         effective_aabb_path=resolved,
+        image_evidence=image_evidence,
     )
     report["warnings"].append("aabb_only_semantic_report_limited")
     report["diagnostics"]["fallback_reason"] = "xpart_aabb_only"

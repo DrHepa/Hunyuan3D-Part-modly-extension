@@ -109,7 +109,8 @@ def export_bundle(
         )
     stem = stable_artifact_stem(artifacts.primary_mesh_path, params)
     output_dir.mkdir(parents=True, exist_ok=True)
-    parts_dir = output_dir / "parts"
+    parts_root = output_dir / "parts"
+    parts_dir = parts_root / stem
     expose_debug_parts = params.output_mode == "debug"
     if expose_debug_parts:
         parts_dir.mkdir(parents=True, exist_ok=True)

@@ -44,15 +44,19 @@ class ExecutionPlan:
     mesh: ValidatedMeshRequest
     params: NormalizedParams
     context: RuntimeContext
+    image_evidence: Mapping[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "mesh": str(self.mesh.mesh_path),
             "mesh_format": self.mesh.mesh_format,
             "params": self.params.to_dict(),
             "host": self.context.host_facts.to_dict(),
             "support": self.context.support.to_dict(),
         }
+        if self.image_evidence is not None:
+            payload["image_evidence"] = dict(self.image_evidence)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -101,12 +105,13 @@ def build_execution_plan(
     *,
     runtime_context: RuntimeContext | None = None,
     project_root: Path | None = None,
+    image_evidence: Mapping[str, object] | None = None,
 ) -> ExecutionPlan:
     mesh = validate_inputs(inputs)
     normalized = normalize_params(params)
     context = runtime_context or resolve_runtime_context(project_root=project_root)
     raise_for_support(context.support)
-    return ExecutionPlan(mesh=mesh, params=normalized, context=context)
+    return ExecutionPlan(mesh=mesh, params=normalized, context=context, image_evidence=image_evidence)
 
 
 def runtime_source_root(project_root: Path) -> Path:
@@ -620,6 +625,7 @@ def decompose_mesh(
     params: dict[str, object] | None = None,
     *,
     output_dir: str | Path,
+    image_evidence: Mapping[str, object] | None = None,
     runtime_adapter: RuntimeAdapter | None = None,
     runtime_context: RuntimeContext | None = None,
     project_root: Path | None = None,
@@ -629,6 +635,7 @@ def decompose_mesh(
         params,
         runtime_context=runtime_context,
         project_root=project_root,
+        image_evidence=image_evidence,
     )
     if runtime_adapter is None:
         raise SetupFailure(

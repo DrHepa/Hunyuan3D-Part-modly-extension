@@ -40,7 +40,7 @@ def _attach_semantic_report(
     if plan.params.semantic_resolver != "analysis":
         return artifacts
     if stage == "x-part":
-        semantic_report = build_xpart_semantic_fallback(plan.params, aabb_path)
+        semantic_report = build_xpart_semantic_fallback(plan.params, aabb_path, image_evidence=plan.image_evidence)
     else:
         effective_aabb_path = artifacts.metadata.get("effective_aabb_path") or artifacts.metadata.get("aabb_path")
         semantic_report = build_semantic_report(
@@ -50,6 +50,7 @@ def _attach_semantic_report(
             bboxes=artifacts.bboxes,
             metadata=artifacts.metadata,
             effective_aabb_path=effective_aabb_path,
+            image_evidence=plan.image_evidence,
         )
     metadata = {**artifacts.metadata, "semantic_report": semantic_report}
     return replace(artifacts, metadata=metadata)
