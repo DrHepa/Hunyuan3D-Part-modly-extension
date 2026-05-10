@@ -1675,6 +1675,102 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(first_bundle["observability"]["artifact_paths"]["parts_dir"], None)
         self.assertEqual(second_bundle["observability"]["artifact_paths"]["parts_dir"], None)
 
+    def test_export_bundle_run_scopes_analysis_sidecars_for_same_inputs(self) -> None:
+        output_dir = self.workspace / "out-rerun-analysis"
+
+        def adapter_with_payload(label: str):
+            def fake_adapter(_plan):
+                return DecompositionArtifacts(
+                    primary_mesh_path=self.mesh,
+                    parts=(),
+                    segmentation={"source": "unit-test", "run_label": label},
+                    bboxes={"parts": [], "run_label": label},
+                    completion={"status": "completed", "run_label": label},
+                    metadata={
+                        "source": "unit-test",
+                        "semantic_report": {
+                            "schema": "hunyuan3d.semantic_report.v1",
+                            "mode": "analysis",
+                            "stage": "p3-sam",
+                            "semantic": False,
+                            "publishable": False,
+                            "effective_part_count": 1,
+                            "confidence": {"aggregate": 0.1, "level": "low"},
+                            "warnings": [label],
+                        },
+                    },
+                )
+
+            return fake_adapter
+
+        first_result = decompose_mesh(
+            {"mesh": self.mesh},
+            {"pipeline_stage": "p3-sam", "seed": 7, "output_mode": "analysis", "semantic_resolver": "analysis"},
+            output_dir=output_dir,
+            runtime_adapter=adapter_with_payload("first"),
+            runtime_context=self.ready_context,
+        )
+        second_result = decompose_mesh(
+            {"mesh": self.mesh},
+            {"pipeline_stage": "p3-sam", "seed": 7, "output_mode": "analysis", "semantic_resolver": "analysis"},
+            output_dir=output_dir,
+            runtime_adapter=adapter_with_payload("second"),
+            runtime_context=self.ready_context,
+        )
+
+        first_bundle = json.loads(Path(first_result["bundle_manifest"]).read_text(encoding="utf-8"))
+        second_bundle = json.loads(Path(second_result["bundle_manifest"]).read_text(encoding="utf-8"))
+        first_analysis_dir = Path(first_result["analysis_dir"])
+        second_analysis_dir = Path(second_result["analysis_dir"])
+
+        self.assertNotEqual(first_analysis_dir, second_analysis_dir)
+        self.assertEqual(first_analysis_dir.parent, output_dir / "analysis")
+        self.assertEqual(second_analysis_dir.parent, output_dir / "analysis")
+        self.assertEqual({path for path in (output_dir / "analysis").iterdir() if path.is_dir()}, {first_analysis_dir, second_analysis_dir})
+
+        for filename in (
+            "segmentation.json",
+            "completion.json",
+            "bboxes.json",
+            "semantic_report.json",
+            "bundle_manifest.json",
+        ):
+            with self.subTest(filename=filename):
+                self.assertTrue((first_analysis_dir / filename).is_file())
+                self.assertTrue((second_analysis_dir / filename).is_file())
+                self.assertNotEqual(first_analysis_dir / filename, second_analysis_dir / filename)
+
+        self.assertEqual(json.loads((first_analysis_dir / "segmentation.json").read_text(encoding="utf-8"))["run_label"], "first")
+        self.assertEqual(json.loads((second_analysis_dir / "segmentation.json").read_text(encoding="utf-8"))["run_label"], "second")
+        self.assertEqual(json.loads((first_analysis_dir / "completion.json").read_text(encoding="utf-8"))["run_label"], "first")
+        self.assertEqual(json.loads((second_analysis_dir / "completion.json").read_text(encoding="utf-8"))["run_label"], "second")
+        self.assertEqual(json.loads((first_analysis_dir / "bboxes.json").read_text(encoding="utf-8"))["run_label"], "first")
+        self.assertEqual(json.loads((second_analysis_dir / "bboxes.json").read_text(encoding="utf-8"))["run_label"], "second")
+        self.assertEqual(json.loads((first_analysis_dir / "semantic_report.json").read_text(encoding="utf-8"))["warnings"], ["first"])
+        self.assertEqual(json.loads((second_analysis_dir / "semantic_report.json").read_text(encoding="utf-8"))["warnings"], ["second"])
+
+        self.assertEqual(first_bundle["sidecars"]["segmentation"], str((first_analysis_dir / "segmentation.json").relative_to(output_dir)))
+        self.assertEqual(second_bundle["sidecars"]["segmentation"], str((second_analysis_dir / "segmentation.json").relative_to(output_dir)))
+        self.assertEqual(first_bundle["sidecars"]["completion"], str((first_analysis_dir / "completion.json").relative_to(output_dir)))
+        self.assertEqual(second_bundle["sidecars"]["completion"], str((second_analysis_dir / "completion.json").relative_to(output_dir)))
+        self.assertEqual(first_bundle["sidecars"]["bboxes"], str((first_analysis_dir / "bboxes.json").relative_to(output_dir)))
+        self.assertEqual(second_bundle["sidecars"]["bboxes"], str((second_analysis_dir / "bboxes.json").relative_to(output_dir)))
+        self.assertEqual(first_bundle["sidecars"]["semantic_report"], str((first_analysis_dir / "semantic_report.json").relative_to(output_dir)))
+        self.assertEqual(second_bundle["sidecars"]["semantic_report"], str((second_analysis_dir / "semantic_report.json").relative_to(output_dir)))
+        self.assertEqual(first_bundle["sidecars"]["bundle_manifest"], str((first_analysis_dir / "bundle_manifest.json").relative_to(output_dir)))
+        self.assertEqual(second_bundle["sidecars"]["bundle_manifest"], str((second_analysis_dir / "bundle_manifest.json").relative_to(output_dir)))
+        self.assertEqual(second_bundle["observability"]["artifact_paths"]["analysis_dir"], str(second_analysis_dir.relative_to(output_dir)))
+        self.assertTrue(second_bundle["routing_contract"]["analysis_sidecars_are_run_scoped"])
+        self.assertTrue(second_bundle["routing_contract"]["root_sidecars_are_latest_aliases"])
+
+        self.assertEqual(json.loads((output_dir / "segmentation.json").read_text(encoding="utf-8"))["run_label"], "second")
+        self.assertEqual(json.loads((output_dir / "completion.json").read_text(encoding="utf-8"))["run_label"], "second")
+        self.assertEqual(json.loads((output_dir / "bboxes.json").read_text(encoding="utf-8"))["run_label"], "second")
+        self.assertEqual(json.loads((output_dir / "semantic_report.json").read_text(encoding="utf-8"))["warnings"], ["second"])
+        root_bundle = json.loads((output_dir / "bundle_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(root_bundle["sidecars"]["bundle_manifest"], second_bundle["sidecars"]["bundle_manifest"])
+        self.assertEqual(root_bundle["metadata"]["compatibility_aliases"]["canonical_dir"], str(second_analysis_dir.relative_to(output_dir)))
+
     def test_export_bundle_writes_semantic_report_sidecar_and_observability_without_changing_primary(self) -> None:
         semantic_report = {
             "schema": "hunyuan3d.semantic_report.v1",
@@ -1707,10 +1803,11 @@ class RuntimeContractTests(unittest.TestCase):
 
         bundle = json.loads(Path(result["bundle_manifest"]).read_text(encoding="utf-8"))
         self.assertEqual(result["primary_mesh"], str(self.workspace / "out-semantic" / Path(result["primary_mesh"]).name))
-        self.assertEqual(result["semantic_report"], str(self.workspace / "out-semantic" / "semantic_report.json"))
+        self.assertEqual(result["semantic_report"], str(Path(result["analysis_dir"]) / "semantic_report.json"))
         self.assertTrue(Path(result["semantic_report"]).is_file())
-        self.assertEqual(bundle["sidecars"]["semantic_report"], "semantic_report.json")
-        self.assertEqual(bundle["observability"]["artifact_paths"]["semantic_report"], "semantic_report.json")
+        self.assertEqual(bundle["sidecars"]["semantic_report"], str((Path(result["analysis_dir"]) / "semantic_report.json").relative_to(self.workspace / "out-semantic")))
+        self.assertEqual(bundle["observability"]["artifact_paths"]["semantic_report"], bundle["sidecars"]["semantic_report"])
+        self.assertEqual(json.loads((self.workspace / "out-semantic" / "semantic_report.json").read_text(encoding="utf-8"))["schema"], semantic_report["schema"])
         self.assertEqual(bundle["observability"]["artifact_paths"]["semantic_summary"]["effective_part_count"], 1)
         self.assertEqual(result["parts"], [])
 

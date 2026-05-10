@@ -55,17 +55,26 @@ def _semantic_report_summary(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _write_semantic_report_sidecar(*, output_dir: Path, metadata: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+def _write_semantic_report_sidecar(
+    *,
+    output_dir: Path,
+    analysis_dir: Path,
+    metadata: dict[str, Any],
+) -> tuple[str | None, dict[str, Any] | None]:
     semantic_report = metadata.get("semantic_report")
     if semantic_report is None:
         return None, None
-    destination = output_dir / "semantic_report.json"
+    destination = analysis_dir / "semantic_report.json"
+    root_alias = output_dir / "semantic_report.json"
     if isinstance(semantic_report, dict):
         _write_json(destination, semantic_report)
+        shutil.copy2(destination, root_alias)
         return str(destination.relative_to(output_dir)), _semantic_report_summary(semantic_report)
     source = Path(str(semantic_report))
     if source.is_file():
-        shutil.copy2(source, destination)
+        if source.resolve() != destination.resolve():
+            shutil.copy2(source, destination)
+        shutil.copy2(destination, root_alias)
         try:
             loaded = json.loads(destination.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -118,6 +127,8 @@ def export_bundle(
     effective_run_id = run_id or new_run_id()
     output_stem = f"{stable_stem}-{effective_run_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    analysis_dir = output_dir / "analysis" / output_stem
+    analysis_dir.mkdir(parents=True, exist_ok=True)
     parts_root = output_dir / "parts"
     parts_dir = parts_root / output_stem
     expose_debug_parts = params.output_mode == "debug"
@@ -147,21 +158,32 @@ def export_bundle(
                     "metadata": part.metadata,
                 }
             )
-    segmentation_path = output_dir / "segmentation.json"
-    bboxes_path = output_dir / "bboxes.json"
+    segmentation_path = analysis_dir / "segmentation.json"
+    bboxes_path = analysis_dir / "bboxes.json"
     _write_json(segmentation_path, artifacts.segmentation)
     _write_json(bboxes_path, artifacts.bboxes)
+    shutil.copy2(segmentation_path, output_dir / "segmentation.json")
+    shutil.copy2(bboxes_path, output_dir / "bboxes.json")
     completion_path: str | None = None
     if artifacts.completion is not None:
-        completion_file = output_dir / "completion.json"
+        completion_file = analysis_dir / "completion.json"
         _write_json(completion_file, artifacts.completion)
+        shutil.copy2(completion_file, output_dir / "completion.json")
         completion_path = str(completion_file.relative_to(output_dir))
+    else:
+        (output_dir / "completion.json").unlink(missing_ok=True)
     semantic_report_path, semantic_report_summary = _write_semantic_report_sidecar(
         output_dir=output_dir,
+        analysis_dir=analysis_dir,
         metadata=artifacts.metadata,
     )
+    if semantic_report_path is None:
+        (output_dir / "semantic_report.json").unlink(missing_ok=True)
+    manifest_path = analysis_dir / "bundle_manifest.json"
     artifact_paths: dict[str, Any] = {
         "primary_mesh": str(primary_output.relative_to(output_dir)),
+        "analysis_dir": str(analysis_dir.relative_to(output_dir)),
+        "bundle_manifest": str(manifest_path.relative_to(output_dir)),
         "parts_dir": str(parts_dir.relative_to(output_dir)) if expose_debug_parts else None,
         "segmentation": str(segmentation_path.relative_to(output_dir)),
         "bboxes": str(bboxes_path.relative_to(output_dir)),
@@ -175,6 +197,18 @@ def export_bundle(
         "stable_artifact_stem": stable_stem,
         "run_id": effective_run_id,
         "output_stem": output_stem,
+        "analysis_dir": str(analysis_dir.relative_to(output_dir)),
+        "compatibility_aliases": {
+            "latest_only": True,
+            "paths": {
+                "segmentation": "segmentation.json",
+                "bboxes": "bboxes.json",
+                "completion": "completion.json" if artifacts.completion is not None else None,
+                "semantic_report": "semantic_report.json" if semantic_report_path else None,
+                "bundle_manifest": "bundle_manifest.json",
+            },
+            "canonical_dir": str(analysis_dir.relative_to(output_dir)),
+        },
     }
     observability = build_observability_record(
         context=context,
@@ -193,6 +227,7 @@ def export_bundle(
             "bboxes": artifact_paths["bboxes"],
             "completion": artifact_paths["completion"],
             "semantic_report": artifact_paths["semantic_report"],
+            "bundle_manifest": artifact_paths["bundle_manifest"],
         },
         "routing_contract": {
             "primary_output_type": "mesh",
@@ -205,12 +240,15 @@ def export_bundle(
             "stable_artifact_stem": stable_stem,
             "run_id": effective_run_id,
             "output_stem": output_stem,
+            "analysis_dir": artifact_paths["analysis_dir"],
+            "analysis_sidecars_are_run_scoped": True,
+            "root_sidecars_are_latest_aliases": True,
         },
         "metadata": export_metadata,
         "observability": observability,
     }
-    manifest_path = output_dir / "bundle_manifest.json"
     _write_json(manifest_path, bundle_manifest)
+    shutil.copy2(manifest_path, output_dir / "bundle_manifest.json")
     LOGGER.info("hunyuan3d_part.export_bundle %s", json.dumps(observability, sort_keys=True))
     return {
         "primary_mesh": str(primary_output),
@@ -220,6 +258,7 @@ def export_bundle(
         "completion": str(output_dir / completion_path) if completion_path else None,
         "semantic_report": str(output_dir / semantic_report_path) if semantic_report_path else None,
         "bundle_manifest": str(manifest_path),
+        "analysis_dir": str(analysis_dir),
         "observability": observability,
         "metadata": export_metadata,
     }
