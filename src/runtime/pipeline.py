@@ -78,32 +78,36 @@ def run_pipeline_stage(
 ) -> DecompositionArtifacts:
     stage = plan.params.pipeline_stage
     if stage == "p3-sam":
+        p3_sam_output_dir = output_dir / ".stage-p3-sam" / plan.run_id
         artifacts = run_upstream_p3_sam(
             plan,
             project_root=project_root,
             managed_python=managed_python,
             model_root=model_root,
-            output_dir=output_dir / ".stage-p3-sam",
+            output_dir=p3_sam_output_dir,
         )
         return _attach_semantic_report(artifacts, stage="p3-sam", plan=plan)
     if stage == "x-part":
         aabb_path = Path(plan.params.aabb_path) if plan.params.aabb_path else None
+        x_part_output_dir = output_dir / ".stage-x-part" / plan.run_id
         artifacts = run_upstream_x_part(
             plan,
             project_root=project_root,
             managed_python=managed_python,
             model_root=model_root,
-            output_dir=output_dir / ".stage-x-part",
+            output_dir=x_part_output_dir,
             aabb_path=aabb_path,
         )
         return _attach_semantic_report(artifacts, stage="x-part", plan=plan, aabb_path=aabb_path)
     if stage == "full":
+        p3_sam_output_dir = output_dir / ".stage-p3-sam" / plan.run_id
+        x_part_output_dir = output_dir / ".stage-x-part" / plan.run_id
         p3_sam_artifacts = run_upstream_p3_sam(
             plan,
             project_root=project_root,
             managed_python=managed_python,
             model_root=model_root,
-            output_dir=output_dir / ".stage-p3-sam",
+            output_dir=p3_sam_output_dir,
         )
         p3_sam_artifacts = _attach_semantic_report(p3_sam_artifacts, stage="full", plan=plan)
         p3_sam_aabb_path = _require_p3_sam_aabb(p3_sam_artifacts)
@@ -112,7 +116,7 @@ def run_pipeline_stage(
             project_root=project_root,
             managed_python=managed_python,
             model_root=model_root,
-            output_dir=output_dir / ".stage-x-part",
+            output_dir=x_part_output_dir,
             aabb_path=p3_sam_aabb_path,
         )
         return _carry_semantic_report(x_part_artifacts, source=p3_sam_artifacts)

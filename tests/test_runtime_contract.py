@@ -188,6 +188,8 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(plan.params.max_parts, DEFAULT_MAX_PARTS)
         self.assertEqual(plan.params.quality_preset, "balanced")
         self.assertEqual(plan.params.semantic_resolver, "off")
+        self.assertIn("run_id", plan.to_dict())
+        self.assertEqual(plan.to_dict()["run_id"], plan.run_id)
 
     def test_supported_export_formats_are_glb_only(self) -> None:
         self.assertEqual(SUPPORTED_EXPORT_FORMATS, ("glb",))
@@ -1188,7 +1190,60 @@ class RuntimeContractTests(unittest.TestCase):
 
         self.assertIs(result, x_part_artifacts)
         p3_mock.assert_called_once()
+        self.assertEqual(p3_mock.call_args.kwargs["output_dir"], self.workspace / "out" / ".stage-p3-sam" / plan.run_id)
+        self.assertEqual(x_part_mock.call_args.kwargs["output_dir"], self.workspace / "out" / ".stage-x-part" / plan.run_id)
         self.assertEqual(x_part_mock.call_args.kwargs["aabb_path"], aabb_path)
+
+    def test_decompose_full_pipeline_uses_run_scoped_stage_dirs_and_bundle_run_id(self) -> None:
+        output_dir = self.workspace / "out-full-run-scoped"
+        aabb_path = self.workspace / "chain-run-scoped" / "auto_mask_mesh_final_aabb.npy"
+        aabb_path.parent.mkdir(parents=True, exist_ok=True)
+        aabb_path.write_bytes(b"npy")
+        p3_artifacts = DecompositionArtifacts(
+            primary_mesh_path=self.mesh,
+            parts=(),
+            segmentation={"source": "p3-sam"},
+            bboxes={"parts": []},
+            completion={"status": "completed"},
+            metadata={"aabb_path": str(aabb_path)},
+        )
+        x_part_artifacts = DecompositionArtifacts(
+            primary_mesh_path=self.mesh,
+            parts=(),
+            segmentation={"source": "x-part"},
+            bboxes={"parts": []},
+            completion={"status": "completed"},
+            metadata={"adapter": "x-part"},
+        )
+
+        def pipeline_adapter(plan):
+            return run_pipeline_stage(
+                plan,
+                project_root=self.workspace,
+                managed_python=self.workspace / "venv" / "bin" / "python",
+                model_root=self.workspace / "models",
+                output_dir=output_dir,
+            )
+
+        with (
+            mock.patch("runtime.pipeline.run_upstream_p3_sam", return_value=p3_artifacts) as p3_mock,
+            mock.patch("runtime.pipeline.run_upstream_x_part", return_value=x_part_artifacts) as x_part_mock,
+        ):
+            result = decompose_mesh(
+                {"mesh": self.mesh},
+                {"pipeline_stage": "full", "seed": 5},
+                output_dir=output_dir,
+                runtime_adapter=pipeline_adapter,
+                runtime_context=self.ready_context,
+            )
+
+        bundle = json.loads(Path(result["bundle_manifest"]).read_text(encoding="utf-8"))
+        run_id = result["observability"]["run_id"]
+        self.assertEqual(p3_mock.call_args.kwargs["output_dir"], output_dir / ".stage-p3-sam" / run_id)
+        self.assertEqual(x_part_mock.call_args.kwargs["output_dir"], output_dir / ".stage-x-part" / run_id)
+        self.assertEqual(bundle["metadata"]["run_id"], run_id)
+        self.assertEqual(bundle["metadata"]["stable_artifact_stem"], result["observability"]["stable_artifact_stem"])
+        self.assertEqual(bundle["routing_contract"]["output_stem"], result["observability"]["output_stem"])
 
     def test_p3_sam_stage_analysis_attaches_semantic_report_after_effective_artifacts(self) -> None:
         plan = build_execution_plan(
@@ -1576,6 +1631,50 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(bundle["sidecars"]["parts"], [])
         self.assertFalse((self.workspace / "out" / "parts").exists())
 
+    def test_export_bundle_primary_uses_run_scoped_output_stems_for_same_inputs(self) -> None:
+        observed_run_ids: list[str] = []
+
+        def fake_adapter(plan):
+            observed_run_ids.append(plan.run_id)
+            return DecompositionArtifacts(
+                primary_mesh_path=self.mesh,
+                parts=(),
+                segmentation={"source": "unit-test"},
+                bboxes={"parts": []},
+                completion={"status": "completed"},
+                metadata={"source": "unit-test"},
+            )
+
+        first_result = decompose_mesh(
+            {"mesh": self.mesh},
+            {"pipeline_stage": "p3-sam", "seed": 7},
+            output_dir=self.workspace / "out-rerun-primary",
+            runtime_adapter=fake_adapter,
+            runtime_context=self.ready_context,
+        )
+        second_result = decompose_mesh(
+            {"mesh": self.mesh},
+            {"pipeline_stage": "p3-sam", "seed": 7},
+            output_dir=self.workspace / "out-rerun-primary",
+            runtime_adapter=fake_adapter,
+            runtime_context=self.ready_context,
+        )
+
+        first_bundle = json.loads(Path(first_result["bundle_manifest"]).read_text(encoding="utf-8"))
+        second_bundle = json.loads(Path(second_result["bundle_manifest"]).read_text(encoding="utf-8"))
+        self.assertNotEqual(first_result["primary_mesh"], second_result["primary_mesh"])
+        self.assertNotEqual(observed_run_ids[0], observed_run_ids[1])
+        self.assertEqual(first_result["observability"]["run_id"], observed_run_ids[0])
+        self.assertEqual(second_result["observability"]["run_id"], observed_run_ids[1])
+        self.assertEqual(first_result["observability"]["stable_artifact_stem"], second_result["observability"]["stable_artifact_stem"])
+        self.assertNotEqual(first_result["observability"]["output_stem"], second_result["observability"]["output_stem"])
+        self.assertTrue(Path(first_result["primary_mesh"]).is_file())
+        self.assertTrue(Path(second_result["primary_mesh"]).is_file())
+        self.assertEqual(second_bundle["metadata"]["run_id"], observed_run_ids[1])
+        self.assertEqual(second_bundle["routing_contract"]["output_stem"], second_result["observability"]["output_stem"])
+        self.assertEqual(first_bundle["observability"]["artifact_paths"]["parts_dir"], None)
+        self.assertEqual(second_bundle["observability"]["artifact_paths"]["parts_dir"], None)
+
     def test_export_bundle_writes_semantic_report_sidecar_and_observability_without_changing_primary(self) -> None:
         semantic_report = {
             "schema": "hunyuan3d.semantic_report.v1",
@@ -1704,7 +1803,7 @@ class RuntimeContractTests(unittest.TestCase):
 
         second_result = decompose_mesh(
             {"mesh": self.mesh},
-            {"output_mode": "debug", "seed": 2},
+            {"output_mode": "debug", "seed": 1},
             output_dir=output_dir,
             runtime_adapter=adapter_with_part_bytes(b"second-arm"),
             runtime_context=self.ready_context,
@@ -1714,6 +1813,9 @@ class RuntimeContractTests(unittest.TestCase):
         second_arm = second_parts_dir / "arm.glb"
 
         self.assertNotEqual(first_parts_dir, second_parts_dir)
+        self.assertNotEqual(first_result["observability"]["run_id"], second_result["observability"]["run_id"])
+        self.assertEqual(first_result["observability"]["stable_artifact_stem"], second_result["observability"]["stable_artifact_stem"])
+        self.assertNotEqual(first_result["observability"]["output_stem"], second_result["observability"]["output_stem"])
         self.assertEqual(first_parts_dir.parent, output_dir / "parts")
         self.assertEqual(second_parts_dir.parent, output_dir / "parts")
         self.assertEqual({path for path in (output_dir / "parts").iterdir() if path.is_dir()}, {first_parts_dir, second_parts_dir})

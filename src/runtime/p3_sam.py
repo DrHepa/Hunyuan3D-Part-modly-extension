@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
-from .config import DEFAULT_MAX_PARTS, NormalizedParams, RuntimeContext, normalize_params, raise_for_support, resolve_runtime_context
+from .config import DEFAULT_MAX_PARTS, NormalizedParams, RuntimeContext, new_run_id, normalize_params, raise_for_support, resolve_runtime_context
 from .errors import RuntimeFailure, SetupFailure
 from .export import DecompositionArtifacts, export_bundle
 from .validate import ValidatedMeshRequest, validate_inputs
@@ -44,6 +44,7 @@ class ExecutionPlan:
     mesh: ValidatedMeshRequest
     params: NormalizedParams
     context: RuntimeContext
+    run_id: str
     image_evidence: Mapping[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -51,6 +52,7 @@ class ExecutionPlan:
             "mesh": str(self.mesh.mesh_path),
             "mesh_format": self.mesh.mesh_format,
             "params": self.params.to_dict(),
+            "run_id": self.run_id,
             "host": self.context.host_facts.to_dict(),
             "support": self.context.support.to_dict(),
         }
@@ -111,7 +113,7 @@ def build_execution_plan(
     normalized = normalize_params(params)
     context = runtime_context or resolve_runtime_context(project_root=project_root)
     raise_for_support(context.support)
-    return ExecutionPlan(mesh=mesh, params=normalized, context=context, image_evidence=image_evidence)
+    return ExecutionPlan(mesh=mesh, params=normalized, context=context, run_id=new_run_id(), image_evidence=image_evidence)
 
 
 def runtime_source_root(project_root: Path) -> Path:
@@ -654,4 +656,5 @@ def decompose_mesh(
         output_dir=Path(output_dir),
         params=plan.params,
         context=plan.context,
+        run_id=plan.run_id,
     )

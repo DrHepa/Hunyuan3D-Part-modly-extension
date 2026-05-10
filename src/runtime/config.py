@@ -8,6 +8,8 @@ import importlib.util
 import os
 import platform
 import sys
+import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -438,6 +440,13 @@ def stable_artifact_stem(mesh_path: Path, params: NormalizedParams) -> str:
         f"{mesh_path.stem}|{params.pipeline_stage}|{params.export_format}|{seed_part}".encode("utf-8")
     ).hexdigest()[:8]
     return f"{mesh_path.stem}-{params.pipeline_stage}-{seed_part}-{digest}"
+
+
+def new_run_id() -> str:
+    """Return a short filesystem-safe identifier for one concrete execution."""
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"{timestamp}-{uuid.uuid4().hex[:8]}"
 
 
 def raise_for_support(assessment: SupportAssessment) -> None:

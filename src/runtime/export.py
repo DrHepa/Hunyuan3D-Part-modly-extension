@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .config import NormalizedParams, RuntimeContext, stable_artifact_stem
+from .config import NormalizedParams, RuntimeContext, new_run_id, stable_artifact_stem
 from .errors import SetupFailure, ValidationError
 
 LOGGER = logging.getLogger(__name__)
@@ -81,6 +81,9 @@ def build_observability_record(
     params: NormalizedParams,
     artifact_paths: dict[str, Any],
     part_count: int,
+    stable_stem: str,
+    run_id: str,
+    output_stem: str,
 ) -> dict[str, Any]:
     return {
         "host": context.host_facts.to_dict(),
@@ -89,6 +92,9 @@ def build_observability_record(
         "seed": params.seed,
         "part_count": part_count,
         "export_format": params.export_format,
+        "stable_artifact_stem": stable_stem,
+        "run_id": run_id,
+        "output_stem": output_stem,
         "artifact_paths": artifact_paths,
     }
 
@@ -99,6 +105,7 @@ def export_bundle(
     output_dir: Path,
     params: NormalizedParams,
     context: RuntimeContext,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     source_suffix = artifacts.primary_mesh_path.suffix.lower().lstrip(".")
     if source_suffix != params.export_format:
@@ -107,14 +114,16 @@ def export_bundle(
             code="unsupported_primary_conversion",
             details={"source": source_suffix, "requested": params.export_format},
         )
-    stem = stable_artifact_stem(artifacts.primary_mesh_path, params)
+    stable_stem = stable_artifact_stem(artifacts.primary_mesh_path, params)
+    effective_run_id = run_id or new_run_id()
+    output_stem = f"{stable_stem}-{effective_run_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
     parts_root = output_dir / "parts"
-    parts_dir = parts_root / stem
+    parts_dir = parts_root / output_stem
     expose_debug_parts = params.output_mode == "debug"
     if expose_debug_parts:
         parts_dir.mkdir(parents=True, exist_ok=True)
-    primary_output = output_dir / f"{stem}.{params.export_format}"
+    primary_output = output_dir / f"{output_stem}.{params.export_format}"
     shutil.copy2(artifacts.primary_mesh_path, primary_output)
     copied_parts: list[dict[str, Any]] = []
     if expose_debug_parts:
@@ -161,11 +170,20 @@ def export_bundle(
     }
     if semantic_report_summary is not None:
         artifact_paths["semantic_summary"] = semantic_report_summary
+    export_metadata = {
+        **artifacts.metadata,
+        "stable_artifact_stem": stable_stem,
+        "run_id": effective_run_id,
+        "output_stem": output_stem,
+    }
     observability = build_observability_record(
         context=context,
         params=params,
         artifact_paths=artifact_paths,
         part_count=len(copied_parts),
+        stable_stem=stable_stem,
+        run_id=effective_run_id,
+        output_stem=output_stem,
     )
     bundle_manifest = {
         "primary_output": artifact_paths["primary_mesh"],
@@ -184,8 +202,11 @@ def export_bundle(
             "parts_are_debug_only": True,
             "semantic": False,
             "downstream_safe": ["UniRig", "Kimodo"],
+            "stable_artifact_stem": stable_stem,
+            "run_id": effective_run_id,
+            "output_stem": output_stem,
         },
-        "metadata": artifacts.metadata,
+        "metadata": export_metadata,
         "observability": observability,
     }
     manifest_path = output_dir / "bundle_manifest.json"
@@ -200,4 +221,5 @@ def export_bundle(
         "semantic_report": str(output_dir / semantic_report_path) if semantic_report_path else None,
         "bundle_manifest": str(manifest_path),
         "observability": observability,
+        "metadata": export_metadata,
     }
