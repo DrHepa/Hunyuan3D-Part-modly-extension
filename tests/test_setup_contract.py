@@ -4229,6 +4229,55 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
 
         self.assertEqual(self.setup._setup_exit_code(readiness), 0)
 
+    def test_setup_exit_code_allows_readiness_fail_closed_after_shell_preparation(self) -> None:
+        readiness = {
+            "execution_ready": False,
+            "base_runtime": {"ready": True, "status": "ready"},
+            "upstream_runtime": {"ready": True, "status": "prepared"},
+            "native_runtime": {"mode": "auto", "ready": False, "status": "unsupported"},
+            "runtime_adapter": {
+                "components": {
+                    "managed_python": {"ready": True},
+                    "runtime_source": {"ready": True},
+                    "entrypoint": {"ready": True},
+                    "import_smoke": {"ready": False, "status": "blocked"},
+                    "weights": {"ready": False, "status": "missing"},
+                }
+            },
+            "weights": {"ready": False},
+            "support": {"ready": False, "status": "blocked"},
+        }
+
+        self.assertEqual(self.setup._setup_exit_code(readiness), 0)
+
+    def test_verify_runtime_probe_uses_windows_safe_python_abi_lookup(self) -> None:
+        captured: dict[str, str] = {}
+
+        def fake_run(command, **kwargs):
+            del kwargs
+            captured["script"] = command[2]
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "ready": True,
+                        "missing": [],
+                        "python_exe": str(command[0]),
+                        "python_version": "3.11.8",
+                        "python_abi": "cp311",
+                        "torch_imported": True,
+                        "cuda_available": False,
+                    }
+                ),
+                stderr="",
+            )
+
+        with mock.patch.object(self.setup.subprocess, "run", side_effect=fake_run):
+            result = self.setup.verify_runtime("python.exe")
+
+        self.assertIn("getattr(sys, 'abiflags', '')", captured["script"])
+        self.assertEqual(result["python_abi"], "cp311")
+
 
 if __name__ == "__main__":
     unittest.main()

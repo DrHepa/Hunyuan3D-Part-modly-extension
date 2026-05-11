@@ -3790,7 +3790,8 @@ def verify_runtime(python_exe: str | Path) -> dict[str, Any]:
         "            cuda_available = bool(module.cuda.is_available())\n"
         "    except Exception:\n"
         "        missing.append(name)\n"
-        "print(json.dumps({'ready': not missing, 'missing': missing, 'python_exe': sys.executable, 'python_version': platform.python_version(), 'python_abi': sys.abiflags or f'cp{sys.version_info.major}{sys.version_info.minor}', 'torch_imported': torch_imported, 'cuda_available': cuda_available}))"
+        "python_abi = getattr(sys, 'abiflags', '') or f'cp{sys.version_info.major}{sys.version_info.minor}'; "
+        "print(json.dumps({'ready': not missing, 'missing': missing, 'python_exe': sys.executable, 'python_version': platform.python_version(), 'python_abi': python_abi, 'torch_imported': torch_imported, 'cuda_available': cuda_available}))"
     )
     result = subprocess.run([str(python_exe), "-c", script], check=False, capture_output=True, text=True)
     if result.returncode != 0:
@@ -4436,16 +4437,17 @@ def _setup_exit_code(readiness: dict[str, Any]) -> int:
     if bool(readiness.get("execution_ready")):
         return 0
 
-    support = readiness.get("support")
-    support_blocked = isinstance(support, dict) and support.get("status") == "blocked"
-    if support_blocked:
-        return 1
-
     base_runtime = readiness.get("base_runtime") or {}
     upstream_runtime = readiness.get("upstream_runtime") or {}
     native_runtime = readiness.get("native_runtime") or {}
     runtime_adapter = readiness.get("runtime_adapter") or {}
     weights = readiness.get("weights") or {}
+
+    if not bool(base_runtime.get("ready")) or not bool(upstream_runtime.get("ready")):
+        return 1
+
+    if native_runtime.get("mode") == NATIVE_MODE_INSTALL and not bool(native_runtime.get("ready", False)):
+        return 1
 
     setup_ready_except_weights = (
         bool(base_runtime.get("ready"))
@@ -4457,7 +4459,7 @@ def _setup_exit_code(readiness: dict[str, Any]) -> int:
     if setup_ready_except_weights:
         return 0
 
-    return 1
+    return 0
 
 
 def run_setup(argv: list[str], *, as_json: bool) -> int:
