@@ -25,12 +25,18 @@ UPSTREAM_REQUIRED_PATHS = (
     Path("XPart") / "partgen" / "models",
 )
 DEFAULT_PROMPT_BATCH_SIZE = 32
+WINDOWS_DEFAULT_PROMPT_BATCH_SIZE = 1
+PROMPT_BATCH_SIZE_ENV_VAR = "HUNYUAN3D_PART_P3SAM_PROMPT_BS"
+PYTORCH_CUDA_ALLOC_CONF_ENV_VAR = "PYTORCH_CUDA_ALLOC_CONF"
+DEFAULT_PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 SONATA_CACHE_ENV_VAR = "P3SAM_SONATA_CACHE"
 IMPORT_SMOKE_MARKER = "__P3SAM_IMPORT_SMOKE__="
 PRIMARY_ARTIFACT_BASENAME = "auto_mask_mesh_final"
 P3_SAM_STDOUT_LOG_NAME = "p3_sam_stdout.log"
 P3_SAM_STDERR_LOG_NAME = "p3_sam_stderr.log"
 P3_SAM_FAILURE_JSON_NAME = "p3_sam_failure.json"
+P3_SAM_DIAGNOSTIC_TAIL_CHARS = 4000
+P3_SAM_DIAGNOSTIC_TAIL_LINES = 40
 P3_SAM_EXPECTED_OUTPUTS = {
     "primary_glb": f"{PRIMARY_ARTIFACT_BASENAME}.glb",
     "primary_ply": f"{PRIMARY_ARTIFACT_BASENAME}.ply",
@@ -343,6 +349,34 @@ def _require_adapter_paths(readiness: AdapterReadiness) -> AdapterPaths:
     )
 
 
+def resolve_prompt_batch_size(os_name: str | None, env: Mapping[str, str] | None = None) -> int:
+    """Resolve upstream P3-SAM prompt batch size with a safer Windows default.
+
+    Upstream ``auto_mask.py`` uses 100k points during mask inference. On Windows,
+    the previous prompt batch of 32 triggered a >6 GiB allocation on an 8 GiB GPU,
+    so keep Linux compatible while lowering Windows to a conservative default.
+    """
+
+    current_env = env or os.environ
+    configured = current_env.get(PROMPT_BATCH_SIZE_ENV_VAR)
+    if configured is not None:
+        try:
+            value = int(configured.strip())
+        except ValueError:
+            value = 0
+        if value <= 0:
+            raise SetupFailure(
+                f"{PROMPT_BATCH_SIZE_ENV_VAR} must be a positive integer when set.",
+                code="invalid_p3_sam_prompt_batch_size",
+                details={"env_var": PROMPT_BATCH_SIZE_ENV_VAR, "observed": configured},
+            )
+        return value
+
+    if (os_name or "").strip().lower() == "windows":
+        return WINDOWS_DEFAULT_PROMPT_BATCH_SIZE
+    return DEFAULT_PROMPT_BATCH_SIZE
+
+
 def build_subprocess_command(
     *,
     managed_python: Path,
@@ -351,7 +385,10 @@ def build_subprocess_command(
     mesh_path: Path,
     output_dir: Path,
     params: NormalizedParams,
+    host_os_name: str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> list[str]:
+    prompt_batch_size = resolve_prompt_batch_size(host_os_name, env=env)
     command = subprocess_command(
         managed_python,
         entrypoint,
@@ -364,7 +401,7 @@ def build_subprocess_command(
         "--seed",
         str(params.seed if params.seed is not None else 42),
         "--prompt_bs",
-        str(DEFAULT_PROMPT_BATCH_SIZE),
+        str(prompt_batch_size),
         "--show_info",
         "0",
         "--show_time_info",
@@ -377,6 +414,51 @@ def build_subprocess_command(
         "0",
     )
     return command
+
+
+def _tail_text(value: str | None, *, max_chars: int = P3_SAM_DIAGNOSTIC_TAIL_CHARS, max_lines: int = P3_SAM_DIAGNOSTIC_TAIL_LINES) -> str:
+    if not value:
+        return ""
+    lines = value.splitlines()[-max_lines:]
+    tail = "\n".join(lines)
+    if value.endswith("\n") and tail:
+        tail += "\n"
+    if len(tail) > max_chars:
+        return tail[-max_chars:]
+    return tail
+
+
+def _existing_artifacts(output_dir: Path) -> list[str]:
+    if not output_dir.is_dir():
+        return []
+    return sorted(str(path) for path in output_dir.iterdir() if path.is_file())
+
+
+def _format_failure_message(*, returncode: int, diagnostics: Mapping[str, str], stdout_tail: str, stderr_tail: str) -> str:
+    lines = [
+        f"Upstream P3-SAM subprocess failed with return code {returncode}.",
+        "Persisted diagnostics:",
+        f"- failure_json: {diagnostics.get('failure')}",
+        f"- stderr_log: {diagnostics.get('stderr')}",
+        f"- stdout_log: {diagnostics.get('stdout')}",
+    ]
+    if stderr_tail:
+        lines.extend(["", "stderr tail:", stderr_tail.rstrip()])
+    if stdout_tail:
+        lines.extend(["", "stdout tail:", stdout_tail.rstrip()])
+    return "\n".join(lines)
+
+
+def _p3_sam_runtime_env_extra(project_root: Path, base_env: Mapping[str, str]) -> dict[str, str]:
+    extra = {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONFAULTHANDLER": "1",
+        SONATA_CACHE_ENV_VAR: str(sonata_cache_root(project_root)),
+    }
+    if not base_env.get(PYTORCH_CUDA_ALLOC_CONF_ENV_VAR):
+        extra[PYTORCH_CUDA_ALLOC_CONF_ENV_VAR] = DEFAULT_PYTORCH_CUDA_ALLOC_CONF
+    return extra
 
 
 def _load_optional_json(path: Path) -> dict[str, object]:
@@ -492,6 +574,8 @@ def _persist_failure_diagnostics(
     failure_path = output_dir / P3_SAM_FAILURE_JSON_NAME
     stdout_path.write_text(result.stdout or "", encoding="utf-8")
     stderr_path.write_text(result.stderr or "", encoding="utf-8")
+    stdout_tail = _tail_text(result.stdout)
+    stderr_tail = _tail_text(result.stderr)
     failure_path.write_text(
         json.dumps(
             {
@@ -500,6 +584,9 @@ def _persist_failure_diagnostics(
                 "returncode": result.returncode,
                 "stdout_log": str(stdout_path),
                 "stderr_log": str(stderr_path),
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "existing_artifacts": _existing_artifacts(output_dir),
             },
             indent=2,
             sort_keys=True,
@@ -595,16 +682,13 @@ def run_upstream_p3_sam(
         mesh_path=plan.mesh.mesh_path,
         output_dir=output_dir,
         params=plan.params,
+        host_os_name=plan.context.host_facts.os_name,
     )
+    base_env = os.environ
     env = build_runtime_env(
-        os.environ,
+        base_env,
         pythonpath=(runtime_source_root(project_root),),
-        extra={
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONUNBUFFERED": "1",
-            "PYTHONFAULTHANDLER": "1",
-            SONATA_CACHE_ENV_VAR: str(sonata_cache_root(project_root)),
-        },
+        extra=_p3_sam_runtime_env_extra(project_root, base_env),
     )
     result = runner(
         command,
@@ -621,15 +705,22 @@ def run_upstream_p3_sam(
             cwd=str(paths.entrypoint.parent),
             result=result,
         )
+        stdout_tail = _tail_text(result.stdout)
+        stderr_tail = _tail_text(result.stderr)
         raise RuntimeFailure(
-            "Upstream P3-SAM subprocess failed. See persisted diagnostics in the output directory.",
+            _format_failure_message(
+                returncode=result.returncode,
+                diagnostics=diagnostics,
+                stdout_tail=stdout_tail,
+                stderr_tail=stderr_tail,
+            ),
             code="p3_sam_subprocess_failed",
             details={
                 "command": command,
                 "cwd": str(paths.entrypoint.parent),
                 "returncode": result.returncode,
-                "stdout": result.stdout[-4000:],
-                "stderr": result.stderr[-4000:],
+                "stdout": stdout_tail,
+                "stderr": stderr_tail,
                 "diagnostics": diagnostics,
             },
         )

@@ -46,7 +46,12 @@ from runtime.platform_support import (
 )
 from runtime.p3_sam import (
     AdapterReadiness,
+    DEFAULT_PROMPT_BATCH_SIZE,
+    DEFAULT_PYTORCH_CUDA_ALLOC_CONF,
+    PROMPT_BATCH_SIZE_ENV_VAR,
+    PYTORCH_CUDA_ALLOC_CONF_ENV_VAR,
     SONATA_CACHE_ENV_VAR,
+    WINDOWS_DEFAULT_PROMPT_BATCH_SIZE,
     AdapterPaths,
     P3_SAM_FAILURE_JSON_NAME,
     P3_SAM_STDERR_LOG_NAME,
@@ -56,6 +61,7 @@ from runtime.p3_sam import (
     build_subprocess_command,
     collect_artifacts as collect_p3_sam_artifacts,
     decompose_mesh,
+    resolve_prompt_batch_size,
     resolve_weight_path,
     run_upstream_p3_sam,
     runtime_source_root,
@@ -755,6 +761,28 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIn("--save_mid_res", command)
         self.assertIn("--post_process", command)
         self.assertEqual(command[command.index("--save_mid_res") + 1], "1")
+        self.assertEqual(command[command.index("--prompt_bs") + 1], str(DEFAULT_PROMPT_BATCH_SIZE))
+
+    def test_windows_subprocess_command_uses_memory_safe_prompt_batch(self) -> None:
+        command = build_subprocess_command(
+            managed_python=self.workspace / "venv" / "Scripts" / "python.exe",
+            entrypoint=self.workspace / ".upstream" / "hunyuan3d-part" / "P3-SAM" / "demo" / "auto_mask.py",
+            weights=self.injected_model_dir / "p3sam.safetensors",
+            mesh_path=self.mesh,
+            output_dir=self.workspace / "out",
+            params=build_execution_plan({"mesh": self.mesh}, runtime_context=self.ready_context).params,
+            host_os_name="windows",
+        )
+
+        self.assertEqual(command[command.index("--prompt_bs") + 1], str(WINDOWS_DEFAULT_PROMPT_BATCH_SIZE))
+
+    def test_prompt_batch_env_override_must_be_positive_integer(self) -> None:
+        self.assertEqual(resolve_prompt_batch_size("windows", env={PROMPT_BATCH_SIZE_ENV_VAR: "4"}), 4)
+
+        with self.assertRaises(SetupFailure) as ctx:
+            resolve_prompt_batch_size("windows", env={PROMPT_BATCH_SIZE_ENV_VAR: "0"})
+
+        self.assertEqual(ctx.exception.code, "invalid_p3_sam_prompt_batch_size")
 
     def test_p3_sam_artifact_collection_requires_save_mid_res_outputs(self) -> None:
         output_dir = self.workspace / "p3sam-out"
@@ -846,6 +874,7 @@ class RuntimeContractTests(unittest.TestCase):
             self.assertEqual(kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
             self.assertEqual(kwargs["env"]["PYTHONUNBUFFERED"], "1")
             self.assertEqual(kwargs["env"]["PYTHONFAULTHANDLER"], "1")
+            self.assertEqual(kwargs["env"][PYTORCH_CUDA_ALLOC_CONF_ENV_VAR], DEFAULT_PYTORCH_CUDA_ALLOC_CONF)
             self.assertEqual(kwargs["env"][SONATA_CACHE_ENV_VAR], str(sonata_cache_root(self.workspace)))
             self.assertEqual(kwargs["cwd"], str(runtime_root / "P3-SAM" / "demo"))
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -889,7 +918,11 @@ class RuntimeContractTests(unittest.TestCase):
         plan = build_execution_plan({"mesh": self.mesh}, runtime_context=self.ready_shell_context)
 
         def failing_runner(_command, **_kwargs):
-            return mock.Mock(returncode=2, stdout="stdout details\n", stderr="stderr details\n")
+            return mock.Mock(
+                returncode=2,
+                stdout="stdout details\n",
+                stderr="before\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 6.10 GiB\n",
+            )
 
         with mock.patch(
             "runtime.p3_sam.verify_upstream_import_smoke",
@@ -906,6 +939,8 @@ class RuntimeContractTests(unittest.TestCase):
                 )
 
         self.assertEqual(ctx.exception.code, "p3_sam_subprocess_failed")
+        self.assertIn("return code 2", ctx.exception.message)
+        self.assertIn("CUDA out of memory", ctx.exception.message)
         diagnostics = ctx.exception.details["diagnostics"]
         stdout_log = Path(diagnostics["stdout"])
         stderr_log = Path(diagnostics["stderr"])
@@ -914,11 +949,18 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(stderr_log.name, P3_SAM_STDERR_LOG_NAME)
         self.assertEqual(failure_json.name, P3_SAM_FAILURE_JSON_NAME)
         self.assertEqual(stdout_log.read_text(encoding="utf-8"), "stdout details\n")
-        self.assertEqual(stderr_log.read_text(encoding="utf-8"), "stderr details\n")
+        self.assertIn("CUDA out of memory", stderr_log.read_text(encoding="utf-8"))
+        self.assertIn(str(failure_json), ctx.exception.message)
+        self.assertIn(str(stderr_log), ctx.exception.message)
+        self.assertIn(str(stdout_log), ctx.exception.message)
         failure_payload = json.loads(failure_json.read_text(encoding="utf-8"))
         self.assertEqual(failure_payload["returncode"], 2)
         self.assertEqual(failure_payload["stdout_log"], str(stdout_log))
         self.assertEqual(failure_payload["stderr_log"], str(stderr_log))
+        self.assertEqual(failure_payload["stdout_tail"], "stdout details\n")
+        self.assertIn("CUDA out of memory", failure_payload["stderr_tail"])
+        self.assertIn(str(stdout_log), failure_payload["existing_artifacts"])
+        self.assertIn(str(stderr_log), failure_payload["existing_artifacts"])
 
     def test_x_part_bundle_resolution_supports_nested_central_model_cache(self) -> None:
         model_root = self.workspace / "Modly" / "models" / "hunyuan3d-part"
