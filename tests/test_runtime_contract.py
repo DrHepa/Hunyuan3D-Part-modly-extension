@@ -845,6 +845,7 @@ class RuntimeContractTests(unittest.TestCase):
         def fake_runner(command, **kwargs):
             self.assertEqual(kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
             self.assertEqual(kwargs["env"]["PYTHONUNBUFFERED"], "1")
+            self.assertEqual(kwargs["env"]["PYTHONFAULTHANDLER"], "1")
             self.assertEqual(kwargs["env"][SONATA_CACHE_ENV_VAR], str(sonata_cache_root(self.workspace)))
             self.assertEqual(kwargs["cwd"], str(runtime_root / "P3-SAM" / "demo"))
             output_dir.mkdir(parents=True, exist_ok=True)

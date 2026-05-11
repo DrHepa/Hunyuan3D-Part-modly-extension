@@ -599,7 +599,12 @@ def run_upstream_p3_sam(
     env = build_runtime_env(
         os.environ,
         pythonpath=(runtime_source_root(project_root),),
-        extra={"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1", SONATA_CACHE_ENV_VAR: str(sonata_cache_root(project_root))},
+        extra={
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONFAULTHANDLER": "1",
+            SONATA_CACHE_ENV_VAR: str(sonata_cache_root(project_root)),
+        },
     )
     result = runner(
         command,

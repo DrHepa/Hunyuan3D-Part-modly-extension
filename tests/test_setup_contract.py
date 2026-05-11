@@ -811,22 +811,28 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
         self.assertEqual(plan.desired_cuda_label, "cu124")
         self.assertEqual(plan.install_strategy, "windows-amd64-prebuilt-wheels")
         self.assertTrue(plan.automatic_install_supported)
-        self.assertEqual([step.package for step in plan.install_steps], ["torch_scatter", "torch_cluster", "spconv"])
-        self.assertEqual(plan.install_steps[0].pip_args, (
+        self.assertEqual([step.package for step in plan.install_steps], ["windows-native-prebuilt-cleanup", "torch_scatter", "torch_cluster", "spconv"])
+        self.assertEqual(plan.install_steps[0].pip_args[:3], ("uninstall", "-y", "spconv"))
+        self.assertIn("spconv-cu120", plan.install_steps[0].pip_args)
+        self.assertIn("spconv-cu124", plan.install_steps[0].pip_args)
+        self.assertIn("spconv-cu126", plan.install_steps[0].pip_args)
+        self.assertIn("cumm-cu126", plan.install_steps[0].pip_args)
+        self.assertIn("torch-scatter", plan.install_steps[0].pip_args)
+        self.assertEqual(plan.install_steps[1].pip_args, (
             "install",
             "torch-scatter==2.1.2+pt25cu124",
             "-f",
             "https://data.pyg.org/whl/torch-2.5.1+cu124.html",
             "--no-cache-dir",
         ))
-        self.assertEqual(plan.install_steps[1].pip_args, (
+        self.assertEqual(plan.install_steps[2].pip_args, (
             "install",
             "torch-cluster==1.6.3+pt25cu124",
             "-f",
             "https://data.pyg.org/whl/torch-2.5.1+cu124.html",
             "--no-cache-dir",
         ))
-        self.assertEqual(plan.install_steps[2].pip_args, ("install", "spconv-cu120==2.3.6", "--no-cache-dir"))
+        self.assertEqual(plan.install_steps[3].pip_args, ("install", "spconv-cu124==2.3.8", "--no-cache-dir"))
 
     def test_build_native_runtime_plan_uses_windows_pyg_wheels_matching_cu128_torch_plan(self) -> None:
         plan = self.setup.build_native_runtime_plan(
@@ -844,22 +850,22 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
         self.assertEqual(plan.desired_cuda_label, "cu128")
         self.assertEqual(plan.install_strategy, "windows-amd64-prebuilt-wheels")
         self.assertTrue(plan.automatic_install_supported)
-        self.assertEqual([step.package for step in plan.install_steps], ["torch_scatter", "torch_cluster", "spconv"])
-        self.assertEqual(plan.install_steps[0].pip_args, (
+        self.assertEqual([step.package for step in plan.install_steps], ["windows-native-prebuilt-cleanup", "torch_scatter", "torch_cluster", "spconv"])
+        self.assertEqual(plan.install_steps[1].pip_args, (
             "install",
             "torch-scatter==2.1.2+pt27cu128",
             "-f",
             "https://data.pyg.org/whl/torch-2.7.0+cu128.html",
             "--no-cache-dir",
         ))
-        self.assertEqual(plan.install_steps[1].pip_args, (
+        self.assertEqual(plan.install_steps[2].pip_args, (
             "install",
             "torch-cluster==1.6.3+pt27cu128",
             "-f",
             "https://data.pyg.org/whl/torch-2.7.0+cu128.html",
             "--no-cache-dir",
         ))
-        self.assertEqual(plan.install_steps[2].pip_args, ("install", "spconv-cu120==2.3.6", "--no-cache-dir"))
+        self.assertEqual(plan.install_steps[3].pip_args, ("install", "spconv-cu126==2.3.8", "--no-cache-dir"))
 
     def test_windows_pyg_wheel_plan_supports_torch_27_cu126_suffix(self) -> None:
         plan = self.setup._windows_pyg_wheel_plan({"packages": ["torch==2.7.0", "torchvision==0.22.0"], "label": "cu126"})
@@ -1402,6 +1408,53 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
         self.assertEqual(probe.status, "blocked")
         self.assertEqual(probe.blocked_imports, ("spconv.pytorch", "torch_scatter", "torch_cluster"))
         self.assertIn("spconv", probe.missing_modules)
+
+    def test_probe_native_runtime_blocks_windows_distribution_mismatch_despite_successful_imports(self) -> None:
+        plan = self.setup.build_native_runtime_plan(
+            system_name="Windows",
+            machine="AMD64",
+            py_tag="cp311",
+            gpu_sm=100,
+            cuda_version=128,
+            native_mode="auto",
+            venv_dir=Path("C:/Users/franc/Tools/Modly/extensions/hunyuan3d-part/venv"),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            managed_python = Path(temp_dir) / "python.exe"
+            managed_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            with mock.patch.object(self.setup.subprocess, "run") as run_mock:
+                run_mock.return_value = mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "imports": {
+                                "spconv": {"ready": True, "status": "ready"},
+                                "spconv.pytorch": {"ready": True, "status": "ready"},
+                                "torch_scatter": {"ready": True, "status": "ready"},
+                                "torch_cluster": {"ready": True, "status": "ready"},
+                                "cumm": {"ready": True, "status": "ready"},
+                            },
+                            "distributions": {
+                                "torch-scatter": "2.1.2+pt27cu128",
+                                "torch-cluster": "1.6.3+pt27cu128",
+                                "spconv-cu126": None,
+                                "spconv-cu120": "2.3.6",
+                                "cumm-cu120": "0.4.11",
+                            },
+                        }
+                    ),
+                    stderr="",
+                )
+                probe = self.setup.probe_native_runtime(managed_python=managed_python, plan=plan)
+
+        self.assertFalse(probe.ready)
+        self.assertEqual(probe.status, "blocked")
+        self.assertEqual(probe.blocked_imports, ())
+        self.assertEqual(probe.expected_distributions["spconv-cu126"], "2.3.8")
+        self.assertEqual(probe.distribution_mismatches["spconv-cu126"]["status"], "missing")
+        self.assertEqual(probe.distribution_mismatches["spconv-cu120"]["status"], "conflicting")
+        self.assertIn("installed Windows native distributions", probe.message)
 
     def test_probe_cumm_core_cc_reports_ready_when_import_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2326,6 +2379,13 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
             related_packages=("cumm",),
             install_steps=(
                 self.setup.NativeInstallStep(
+                    package="windows-native-prebuilt-cleanup",
+                    requirement="spconv spconv-cu120 spconv-cu124 spconv-cu126 cumm cumm-cu120 cumm-cu124 cumm-cu126 torch-scatter torch-cluster",
+                    strategy="pip-uninstall-conflicting-prebuilt-wheels",
+                    status="planned",
+                    pip_args=("uninstall", "-y", "spconv", "spconv-cu120", "spconv-cu124", "spconv-cu126", "cumm", "cumm-cu120", "cumm-cu124", "cumm-cu126", "torch-scatter", "torch-cluster"),
+                ),
+                self.setup.NativeInstallStep(
                     package="torch_scatter",
                     requirement="torch-scatter==2.1.2+pt25cu124",
                     strategy="pip-prebuilt-wheel",
@@ -2341,10 +2401,10 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
                 ),
                 self.setup.NativeInstallStep(
                     package="spconv",
-                    requirement="spconv-cu120==2.3.6",
+                    requirement="spconv-cu124==2.3.8",
                     strategy="pip-prebuilt-wheel",
                     status="planned",
-                    pip_args=("install", "spconv-cu120==2.3.6"),
+                    pip_args=("install", "spconv-cu124==2.3.8"),
                 ),
             ),
             install_strategy="windows-amd64-prebuilt-wheels",
@@ -2379,6 +2439,7 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
             mock.patch.object(self.setup, "probe_native_runtime", side_effect=[blocked_probe, ready_probe]) as probe_mock,
         ):
             installer = mock.Mock(side_effect=[
+                {"package": "windows-native-prebuilt-cleanup", "status": "installed"},
                 {"package": "torch_scatter", "status": "installed"},
                 {"package": "torch_cluster", "status": "installed"},
                 {"package": "spconv", "status": "installed"},
@@ -2399,7 +2460,7 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
         self.assertTrue(result["attempted_install"])
         self.assertTrue(result["ready"])
         self.assertEqual(result["install_strategy"], "windows-amd64-prebuilt-wheels")
-        self.assertEqual([call.kwargs["step"].package for call in installer.call_args_list], ["torch_scatter", "torch_cluster", "spconv"])
+        self.assertEqual([call.kwargs["step"].package for call in installer.call_args_list], ["windows-native-prebuilt-cleanup", "torch_scatter", "torch_cluster", "spconv"])
 
     def test_run_native_runtime_phase_install_can_use_monkeypatched_runner(self) -> None:
         plan = self.setup.NativeRuntimePlan(

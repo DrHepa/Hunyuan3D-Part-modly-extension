@@ -36,7 +36,28 @@ SETUP_SUMMARY_NAME = ".modly-setup-summary.json"
 NATIVE_BUILD_ARTIFACTS_DIRNAME = ".modly/native-build-artifacts"
 TORCH_SCATTER_VERSION = "2.1.2"
 TORCH_CLUSTER_VERSION = "1.6.3"
-WINDOWS_SPCONV_CU120_PACKAGE = "spconv-cu120==2.3.6"
+WINDOWS_SPCONV_VERSION = "2.3.8"
+WINDOWS_SPCONV_PACKAGES_BY_CUDA_LABEL = {
+    "cu118": f"spconv-cu118=={WINDOWS_SPCONV_VERSION}",
+    "cu124": f"spconv-cu124=={WINDOWS_SPCONV_VERSION}",
+    "cu126": f"spconv-cu126=={WINDOWS_SPCONV_VERSION}",
+    # spconv-cu128 does not publish Windows wheels; cu126 is the closest compatible prebuilt lane.
+    "cu128": f"spconv-cu126=={WINDOWS_SPCONV_VERSION}",
+}
+WINDOWS_NATIVE_PREBUILT_CLEANUP_PACKAGES = (
+    "spconv",
+    "spconv-cu118",
+    "spconv-cu120",
+    "spconv-cu124",
+    "spconv-cu126",
+    "cumm",
+    "cumm-cu118",
+    "cumm-cu120",
+    "cumm-cu124",
+    "cumm-cu126",
+    "torch-scatter",
+    "torch-cluster",
+)
 RUNTIME_PACKAGES = [
     "numpy",
     "trimesh",
@@ -732,6 +753,9 @@ class NativeRuntimeProbe:
     blocked_imports: tuple[str, ...]
     message: str
     next_action: str
+    expected_distributions: dict[str, str] | None = None
+    installed_distributions: dict[str, str | None] | None = None
+    distribution_mismatches: dict[str, dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -743,6 +767,9 @@ class NativeRuntimeProbe:
             "blocked_imports": list(self.blocked_imports),
             "message": self.message,
             "next_action": self.next_action,
+            "expected_distributions": dict(self.expected_distributions or {}),
+            "installed_distributions": dict(self.installed_distributions or {}),
+            "distribution_mismatches": dict(self.distribution_mismatches or {}),
         }
 
 
@@ -1474,15 +1501,63 @@ def _windows_pyg_wheel_plan(torch_plan: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _windows_spconv_requirement(cuda_label: str) -> str:
+    normalized = str(cuda_label or "").strip().lower()
+    requirement = WINDOWS_SPCONV_PACKAGES_BY_CUDA_LABEL.get(normalized)
+    if requirement is None:
+        raise RuntimeError(f"No Windows spconv prebuilt package is encoded for CUDA label {normalized!r}.")
+    return requirement
+
+
+def _requirement_name_and_version(requirement: str) -> tuple[str, str | None]:
+    name, sep, version = str(requirement).partition("==")
+    return name.strip(), version.strip() if sep else None
+
+
+def _windows_expected_native_distributions(plan: NativeRuntimePlan) -> dict[str, str]:
+    if plan.install_strategy != "windows-amd64-prebuilt-wheels":
+        return {}
+    expected: dict[str, str] = {}
+    for step in plan.install_steps:
+        if step.package == "windows-native-prebuilt-cleanup":
+            continue
+        name, version = _requirement_name_and_version(step.requirement)
+        if name and version:
+            expected[name] = version
+    return expected
+
+
+def _windows_allowed_native_distributions(expected_distributions: dict[str, str]) -> set[str]:
+    allowed = set(expected_distributions)
+    for dist_name in expected_distributions:
+        match = re.fullmatch(r"spconv-(cu\d+)", dist_name)
+        if match:
+            allowed.add(f"cumm-{match.group(1)}")
+    return allowed
+
+
 def _windows_amd64_native_install_steps(torch_plan: dict[str, Any]) -> tuple[NativeInstallStep, ...]:
     pyg_plan = _windows_pyg_wheel_plan(torch_plan)
     pyg_suffix = pyg_plan["suffix"]
     pyg_index_url = pyg_plan["index_url"]
+    spconv_requirement = _windows_spconv_requirement(pyg_plan["cuda_label"])
+    spconv_package, _spconv_version = _requirement_name_and_version(spconv_requirement)
     reason = (
         "Windows AMD64 uses PyG prebuilt wheels matching the managed PyTorch/CUDA install plan "
         f"({pyg_plan['torch_version']}+{pyg_plan['cuda_label']}) instead of source builds."
     )
     return (
+        NativeInstallStep(
+            package="windows-native-prebuilt-cleanup",
+            requirement=" ".join(WINDOWS_NATIVE_PREBUILT_CLEANUP_PACKAGES),
+            strategy="pip-uninstall-conflicting-prebuilt-wheels",
+            status="planned",
+            pip_args=("uninstall", "-y", *WINDOWS_NATIVE_PREBUILT_CLEANUP_PACKAGES),
+            reason=(
+                "Remove stale/conflicting spconv, cumm, torch-scatter, and torch-cluster native distributions before "
+                "installing the selected Windows prebuilt lane; spconv upstream warns against mixed variants."
+            ),
+        ),
         NativeInstallStep(
             package="torch_scatter",
             requirement=f"torch-scatter=={TORCH_SCATTER_VERSION}+{pyg_suffix}",
@@ -1513,11 +1588,14 @@ def _windows_amd64_native_install_steps(torch_plan: dict[str, Any]) -> tuple[Nat
         ),
         NativeInstallStep(
             package="spconv",
-            requirement=WINDOWS_SPCONV_CU120_PACKAGE,
+            requirement=spconv_requirement,
             strategy="pip-prebuilt-wheel",
             status="planned",
-            pip_args=("install", WINDOWS_SPCONV_CU120_PACKAGE, "--no-cache-dir"),
-            reason="spconv-cu120 publishes cp311/cp312 Windows AMD64 wheels and imports as the spconv module.",
+            pip_args=("install", spconv_requirement, "--no-cache-dir"),
+            reason=(
+                f"{spconv_package} publishes cp311 Windows AMD64 wheels and imports as the spconv module; "
+                "cu128 intentionally uses the cu126 spconv lane because no spconv-cu128 wheel exists."
+            ),
         ),
     )
 
@@ -1604,7 +1682,7 @@ def build_native_runtime_plan(
         lane = f"windows-amd64-{desired_cuda_label}-prebuilt"
         state = SUPPORTED
         reason = (
-            "Windows AMD64 uses prebuilt PyG wheels matching the selected PyTorch/CUDA lane plus spconv-cu120; "
+            "Windows AMD64 uses prebuilt PyG wheels matching the selected PyTorch/CUDA lane plus a matching spconv CUDA wheel; "
             "runtime inference still depends on the managed import smoke passing on the target host."
         )
 
@@ -1752,6 +1830,7 @@ def build_native_runtime_plan(
 
 
 def probe_native_runtime(*, managed_python: Path, plan: NativeRuntimePlan) -> NativeRuntimeProbe:
+    expected_distributions = _windows_expected_native_distributions(plan)
     if not managed_python.exists():
         return NativeRuntimeProbe(
             ready=False,
@@ -1762,11 +1841,15 @@ def probe_native_runtime(*, managed_python: Path, plan: NativeRuntimePlan) -> Na
             blocked_imports=(),
             message="Managed Python is missing, so native runtime imports cannot be probed yet.",
             next_action="Run managed setup/repair to create the extension venv before probing native dependencies.",
+            expected_distributions=expected_distributions,
         )
 
     script = (
         "import importlib, json; "
+        "from importlib import metadata; "
         f"mods={list(_native_probe_modules())!r}; "
+        f"expected_dists={expected_distributions!r}; "
+        f"conflicting_dists={list(WINDOWS_NATIVE_PREBUILT_CLEANUP_PACKAGES)!r}; "
         "payload={}; "
         "\nfor name in mods:\n"
         "    try:\n"
@@ -1774,7 +1857,13 @@ def probe_native_runtime(*, managed_python: Path, plan: NativeRuntimePlan) -> Na
         "        payload[name]={'ready': True, 'status': 'ready'}\n"
         "    except Exception as exc:\n"
         "        payload[name]={'ready': False, 'status': 'missing', 'error_type': type(exc).__name__, 'error': str(exc)}\n"
-        "print(json.dumps(payload, sort_keys=True))"
+        "installed_dists={}\n"
+        "for dist_name in sorted(set(expected_dists) | set(conflicting_dists)):\n"
+        "    try:\n"
+        "        installed_dists[dist_name] = metadata.version(dist_name)\n"
+        "    except metadata.PackageNotFoundError:\n"
+        "        installed_dists[dist_name] = None\n"
+        "print(json.dumps({'imports': payload, 'distributions': installed_dists}, sort_keys=True))"
     )
     result = subprocess.run([str(managed_python), "-c", script], check=False, capture_output=True, text=True)
     if result.returncode != 0:
@@ -1787,21 +1876,55 @@ def probe_native_runtime(*, managed_python: Path, plan: NativeRuntimePlan) -> Na
             blocked_imports=plan.required_imports,
             message="Native runtime probe failed before import status could be decoded.",
             next_action="Inspect the managed Python stderr and repair the extension venv before retrying.",
+            expected_distributions=expected_distributions,
         )
 
-    imports = json.loads(result.stdout.strip() or "{}")
+    raw_probe = json.loads(result.stdout.strip() or "{}")
+    if "imports" in raw_probe or "distributions" in raw_probe:
+        imports = raw_probe.get("imports") or {}
+        installed_distributions = raw_probe.get("distributions") or {}
+    else:
+        imports = raw_probe
+        installed_distributions = {}
     missing_modules = tuple(name for name, status in imports.items() if not status.get("ready", False))
     blocked_imports = tuple(name for name in plan.required_imports if name in missing_modules)
-    ready = not blocked_imports
+    distribution_mismatches: dict[str, dict[str, Any]] = {}
+    if expected_distributions:
+        for dist_name, expected_version in expected_distributions.items():
+            installed_version = installed_distributions.get(dist_name)
+            if installed_version != expected_version:
+                distribution_mismatches[dist_name] = {
+                    "expected": expected_version,
+                    "installed": installed_version,
+                    "status": "missing" if installed_version is None else "mismatched",
+                }
+        allowed_names = _windows_allowed_native_distributions(expected_distributions)
+        for dist_name in WINDOWS_NATIVE_PREBUILT_CLEANUP_PACKAGES:
+            installed_version = installed_distributions.get(dist_name)
+            if installed_version is not None and dist_name not in allowed_names:
+                distribution_mismatches[dist_name] = {
+                    "expected": None,
+                    "installed": installed_version,
+                    "status": "conflicting",
+                }
+    ready = not blocked_imports and not distribution_mismatches
     message = (
         "Native runtime imports are ready."
         if ready
-        else "Native runtime imports are blocked; adapter import smoke will fail closed until required modules are present."
+        else (
+            "Native runtime imports are blocked; adapter import smoke will fail closed until required modules are present."
+            if blocked_imports
+            else "Native runtime imports succeeded, but installed Windows native distributions do not match the planned prebuilt lane."
+        )
     )
     next_action = (
         "None. Native runtime imports are present."
         if ready
-        else "Provide a validated native dependency install path or repair the managed venv manually for the reported lane."
+        else (
+            "Provide a validated native dependency install path or repair the managed venv manually for the reported lane."
+            if blocked_imports
+            else "Run managed setup/repair again so the cleanup step removes stale native wheels and installs the planned Windows lane."
+        )
     )
     return NativeRuntimeProbe(
         ready=ready,
@@ -1812,6 +1935,9 @@ def probe_native_runtime(*, managed_python: Path, plan: NativeRuntimePlan) -> Na
         blocked_imports=blocked_imports,
         message=message,
         next_action=next_action,
+        expected_distributions=expected_distributions,
+        installed_distributions=installed_distributions,
+        distribution_mismatches=distribution_mismatches,
     )
 
 
