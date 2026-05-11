@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,7 @@ from runtime.config import (
     infer_model_root,
     normalize_params,
     resolve_host_facts,
+    resolve_python_abi_tag,
     resolve_runtime_context,
     resolve_x_part_resource_limits,
 )
@@ -175,6 +177,11 @@ class RuntimeContractTests(unittest.TestCase):
             facts = resolve_host_facts(env={})
 
         self.assertTrue(facts.cuda_visible)
+
+    def test_resolve_python_abi_tag_does_not_require_sys_abiflags(self) -> None:
+        windows_like_sys = SimpleNamespace(version_info=SimpleNamespace(major=3, minor=11))
+
+        self.assertEqual(resolve_python_abi_tag(windows_like_sys), "cp311")
 
     def test_managed_venv_resolver_uses_platform_specific_layouts(self) -> None:
         venv = self.workspace / "venv with spaces"

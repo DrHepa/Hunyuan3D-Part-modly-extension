@@ -191,7 +191,7 @@ def resolve_host_facts(
         os_name=platform.system().lower(),
         arch=platform.machine().lower(),
         python_version=platform.python_version(),
-        python_abi=sys.abiflags or f"cp{sys.version_info.major}{sys.version_info.minor}",
+        python_abi=resolve_python_abi_tag(),
         cuda_visible=cuda_visible,
     )
 
@@ -239,6 +239,18 @@ def inspect_dependencies(
         except Exception:
             dependencies[module] = False
     return dependencies
+
+
+def resolve_python_abi_tag(sys_module: object = sys) -> str:
+    """Return a CPython ABI tag without assuming POSIX-only sys.abiflags.
+
+    Windows CPython does not expose ``sys.abiflags``. Falling back to the
+    interpreter major/minor tag keeps host fact collection portable.
+    """
+
+    version_info = getattr(sys_module, "version_info", sys.version_info)
+    abiflags = getattr(sys_module, "abiflags", "")
+    return str(abiflags or f"cp{version_info.major}{version_info.minor}")
 
 
 def evaluate_host_support(
