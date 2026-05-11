@@ -446,6 +446,37 @@ class RuntimeContractTests(unittest.TestCase):
         readiness = generator.readiness_status()
         self.assertTrue(readiness["setup"]["ready"])
 
+    def test_generator_readiness_prioritizes_missing_weights_over_host_runtime_failure(self) -> None:
+        managed_python = self.workspace / "venv" / "bin" / "python"
+        managed_python.parent.mkdir(parents=True, exist_ok=True)
+        managed_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        runtime_context = resolve_runtime_context(
+            project_root=self.workspace,
+            host_facts=HostFacts(
+                os_name="windows",
+                arch="amd64",
+                python_version="3.11.8",
+                python_abi="cp311",
+                cuda_visible=False,
+            ),
+            dependency_checker=lambda _: object(),
+        )
+        generator = Hunyuan3DPartGenerator(
+            self.injected_model_dir,
+            self.workspace,
+            project_root=self.workspace,
+            runtime_context=runtime_context,
+        )
+
+        with mock.patch("generator.probe_torch_cuda_availability", return_value=False):
+            readiness = generator.readiness_status()
+
+        self.assertEqual(readiness["machine_code"], "setup_pending")
+        self.assertEqual(readiness["label_hint"], "Setup pending")
+        self.assertEqual(readiness["blockers"][0]["component"], "weights")
+        self.assertEqual(readiness["blockers"][1]["component"], "host_support")
+        self.assertIn("Missing required model weights", readiness["reason"])
+
     def test_generator_readiness_exposes_modly_contract_fields_when_ready(self) -> None:
         managed_python = self.workspace / "venv" / "bin" / "python"
         managed_python.parent.mkdir(parents=True, exist_ok=True)

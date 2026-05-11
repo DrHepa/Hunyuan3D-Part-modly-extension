@@ -104,12 +104,12 @@ class Hunyuan3DPartGenerator(BaseGenerator):
     ) -> str:
         if ok:
             return "ready"
-        if not bool(host_support.get("ready", False)):
-            return "runtime_unavailable"
         if not bool(setup.get("ready", False)):
             return "setup_pending"
         if not bool(weights.get("ready", False)):
             return "setup_pending"
+        if not bool(host_support.get("ready", False)):
+            return "runtime_unavailable"
         if not bool(runtime_adapter.get("ready", False)):
             return "runtime_unavailable"
         return "runtime_unavailable"
@@ -215,15 +215,19 @@ class Hunyuan3DPartGenerator(BaseGenerator):
 
     def _collect_runtime_blockers(self, readiness: Mapping[str, object]) -> list[dict[str, object]]:
         blockers: list[dict[str, object]] = []
-        host_support = readiness["host_support"]
-        if isinstance(host_support, Mapping) and not bool(host_support.get("ready", False)):
-            blocker = {"component": "host_support", **dict(host_support)}
-            blockers.append(blocker)
-        for key in ("setup", "runtime_adapter", "weights"):
+        for key in ("setup", "weights"):
             section = readiness[key]
             if isinstance(section, Mapping) and not bool(section.get("ready", False)):
                 if key == "setup" and section.get("status") == "prepared_shell":
                     continue
+                blockers.append({"component": key, **dict(section)})
+        host_support = readiness["host_support"]
+        if isinstance(host_support, Mapping) and not bool(host_support.get("ready", False)):
+            blocker = {"component": "host_support", **dict(host_support)}
+            blockers.append(blocker)
+        for key in ("runtime_adapter",):
+            section = readiness[key]
+            if isinstance(section, Mapping) and not bool(section.get("ready", False)):
                 blockers.append({"component": key, **dict(section)})
         return blockers
 
