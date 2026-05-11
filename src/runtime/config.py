@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from .errors import CompatibilityFailure, DependencyFailure, HunyuanPartError, ValidationError
+from .platform_support import NATIVE_DEPENDENCY_MODULES, detect_cuda_toolkit, memory_guard_status
 
 ALLOWED_MESH_FORMATS = ("glb", "obj", "stl", "ply")
 SUPPORTED_EXPORT_FORMATS = ("glb",)
@@ -28,7 +29,7 @@ DEFAULT_PARAMS = {
     "output_mode": "primary",
     "semantic_resolver": "off",
 }
-REQUIRED_RUNTIME_MODULES = ("numpy", "torch", "trimesh")
+REQUIRED_RUNTIME_MODULES = ("numpy", "torch", "trimesh", *NATIVE_DEPENDENCY_MODULES[1:])
 MINIMUM_PYTHON = (3, 10)
 DEFAULT_MAX_PARTS = 32
 MAX_PARTS_HARD_CAP = 512
@@ -138,6 +139,13 @@ class SupportAssessment:
     warnings: tuple[str, ...] = ()
     failure: dict[str, object] | None = None
     dependencies: dict[str, bool] = field(default_factory=dict)
+    platform_supported: bool = True
+    cuda_ready: bool = False
+    native_wheels_ready: bool = False
+    runtime_dependencies_ready: bool = False
+    inference_supported: bool = False
+    diagnostics: dict[str, object] = field(default_factory=dict)
+    resource_limits: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -145,6 +153,13 @@ class SupportAssessment:
             "status": self.status,
             "warnings": list(self.warnings),
             "dependencies": self.dependencies,
+            "platform_supported": self.platform_supported,
+            "cuda_ready": self.cuda_ready,
+            "native_wheels_ready": self.native_wheels_ready,
+            "runtime_dependencies_ready": self.runtime_dependencies_ready,
+            "inference_supported": self.inference_supported,
+            "diagnostics": self.diagnostics,
+            "resource_limits": self.resource_limits,
         }
         if self.failure:
             payload["failure"] = self.failure
@@ -217,7 +232,13 @@ def inspect_dependencies(
     dependency_checker: Callable[[str], object | None] | None = None,
 ) -> dict[str, bool]:
     checker = dependency_checker or importlib.util.find_spec
-    return {module: checker(module) is not None for module in REQUIRED_RUNTIME_MODULES}
+    dependencies: dict[str, bool] = {}
+    for module in REQUIRED_RUNTIME_MODULES:
+        try:
+            dependencies[module] = checker(module) is not None
+        except Exception:
+            dependencies[module] = False
+    return dependencies
 
 
 def evaluate_host_support(
@@ -227,6 +248,18 @@ def evaluate_host_support(
 ) -> SupportAssessment:
     warnings: list[str] = []
     dependencies = inspect_dependencies(dependency_checker)
+    cuda_diagnostics = detect_cuda_toolkit(host_facts.os_name, os.environ)
+    cuda_ready = bool(host_facts.cuda_visible)
+    native_wheels_ready = all(dependencies.get(module, False) for module in NATIVE_DEPENDENCY_MODULES[1:])
+    runtime_dependencies_ready = all(dependencies.values())
+    resource_limits = {"memory_guard": memory_guard_status(host_facts.os_name)}
+    diagnostics = {
+        "cuda": cuda_diagnostics,
+        "native_dependencies": {
+            "required": list(REQUIRED_RUNTIME_MODULES),
+            "missing": [name for name, present in dependencies.items() if not present],
+        },
+    }
     version_parts = host_facts.python_version.split(".")
     version_tuple = tuple(int(part) for part in version_parts[:2])
     if host_facts.os_name == "linux" and host_facts.arch in {"aarch64", "arm64"}:
@@ -241,8 +274,14 @@ def evaluate_host_support(
                 details={"required": ">=3.10", "observed": host_facts.python_version},
             ).to_dict(),
             dependencies=dependencies,
+            cuda_ready=cuda_ready,
+            native_wheels_ready=native_wheels_ready,
+            runtime_dependencies_ready=runtime_dependencies_ready,
+            inference_supported=False,
+            diagnostics=diagnostics,
+            resource_limits=resource_limits,
         )
-    if not host_facts.cuda_visible:
+    if not cuda_ready:
         warnings.append("cpu_fallback_not_advertised")
         return SupportAssessment(
             ready=False,
@@ -254,6 +293,12 @@ def evaluate_host_support(
                 details=host_facts.to_dict(),
             ).to_dict(),
             dependencies=dependencies,
+            cuda_ready=False,
+            native_wheels_ready=native_wheels_ready,
+            runtime_dependencies_ready=runtime_dependencies_ready,
+            inference_supported=False,
+            diagnostics=diagnostics,
+            resource_limits=resource_limits,
         )
     missing = [name for name, present in dependencies.items() if not present]
     if missing:
@@ -266,12 +311,24 @@ def evaluate_host_support(
                 details={"missing": missing},
             ).to_dict(),
             dependencies=dependencies,
+            cuda_ready=cuda_ready,
+            native_wheels_ready=native_wheels_ready,
+            runtime_dependencies_ready=False,
+            inference_supported=False,
+            diagnostics=diagnostics,
+            resource_limits=resource_limits,
         )
     return SupportAssessment(
         ready=True,
         status="ready_with_warnings" if warnings else "ready",
         warnings=tuple(warnings),
         dependencies=dependencies,
+        cuda_ready=cuda_ready,
+        native_wheels_ready=native_wheels_ready,
+        runtime_dependencies_ready=runtime_dependencies_ready,
+        inference_supported=True,
+        diagnostics=diagnostics,
+        resource_limits=resource_limits,
     )
 
 
@@ -431,6 +488,7 @@ def resolve_x_part_resource_limits(params: NormalizedParams) -> dict[str, object
         "min_bbox_point_count": min_bbox_point_count,
         "point_budget_policy": "cap_total_bbox_points_by_effective_max_parts",
         "torch_dtype": str(profile["torch_dtype"]),
+        "memory_guard": memory_guard_status(),
     }
 
 

@@ -22,6 +22,7 @@ if str(SRC) not in sys.path:
 
 from runtime.config import HostFacts, evaluate_host_support, resolve_runtime_context  # noqa: E402
 from generator import Hunyuan3DPartGenerator  # noqa: E402
+from runtime.platform_support import detect_cuda_toolkit, managed_bin_dir, managed_pip_path, managed_python_path, subprocess_command  # noqa: E402
 from runtime.p3_sam import (  # noqa: E402
     SONATA_CACHE_ENV_VAR,
     UPSTREAM_REQUIRED_PATHS,
@@ -745,15 +746,19 @@ class NativeRuntimeProbe:
 
 
 def venv_python(venv_dir: Path) -> Path:
-    return venv_dir / ("Scripts/python.exe" if platform.system() == "Windows" else "bin/python")
+    return managed_python_path(venv_dir, platform.system())
 
 
 def venv_bin_dir(venv_dir: Path) -> Path:
-    return venv_dir / ("Scripts" if platform.system() == "Windows" else "bin")
+    return managed_bin_dir(venv_dir, platform.system())
+
+
+def venv_pip(venv_dir: Path) -> Path:
+    return managed_pip_path(venv_dir, platform.system())
 
 
 def pip_run(venv_dir: Path, *args: str) -> None:
-    subprocess.run([str(venv_python(venv_dir)), "-m", "pip", *args], check=True)
+    subprocess.run(subprocess_command(venv_python(venv_dir), "-m", "pip", *args), check=True)
 
 
 def pip_install(venv_dir: Path, *packages: str, index_url: str | None = None, extra_index_url: str | None = None) -> None:
@@ -1120,14 +1125,14 @@ def _cumm_arch_override_note(gpu_sm: int) -> str | None:
 
 def _prepend_env_path(value: str, current: str | None = None) -> str:
     current_value = str(current or "").strip()
-    return f"{value}:{current_value}" if current_value else value
+    return f"{value}{os.pathsep}{current_value}" if current_value else value
 
 
 def _unique_path_entries(*groups: str | None) -> list[str]:
     entries: list[str] = []
     seen: set[str] = set()
     for group in groups:
-        for raw_entry in str(group or "").split(":"):
+        for raw_entry in str(group or "").split(os.pathsep):
             entry = raw_entry.strip()
             if not entry or entry in seen:
                 continue
@@ -1138,7 +1143,7 @@ def _unique_path_entries(*groups: str | None) -> list[str]:
 
 def _join_path_entries(*groups: str | None, blocked: set[str] | None = None) -> str:
     blocked_entries = {item.strip() for item in (blocked or set()) if item and item.strip()}
-    return ":".join(entry for entry in _unique_path_entries(*groups) if entry not in blocked_entries)
+    return os.pathsep.join(entry for entry in _unique_path_entries(*groups) if entry not in blocked_entries)
 
 
 def _prepend_flag(value: str, current: str | None = None) -> str:
@@ -1164,6 +1169,8 @@ def _read_nvcc_release(nvcc_path: Path) -> str | None:
 
 
 def _cuda_toolkit_lib_dirs(toolkit_root: Path) -> list[Path]:
+    if platform.system() == "Windows":
+        return [toolkit_root / "lib" / "x64"]
     return [
         toolkit_root / "lib64",
         toolkit_root / "targets" / "sbsa-linux" / "lib",
@@ -1175,7 +1182,7 @@ def _cuda_toolkit_include_dir(toolkit_root: Path) -> Path:
 
 
 def _cuda_toolkit_nvcc_path(toolkit_root: Path) -> Path:
-    return toolkit_root / "bin" / "nvcc"
+    return toolkit_root / "bin" / ("nvcc.exe" if platform.system() == "Windows" else "nvcc")
 
 
 def _cuda_toolkit_metadata(toolkit_root: str | None, lib_dirs: list[str] | tuple[str, ...] | None = None) -> dict[str, Any]:
@@ -1206,6 +1213,32 @@ def resolve_cuda_toolkit_for_label(label: str | None) -> dict[str, Any]:
             "status": "not-applicable",
             "reason": "No CUDA toolkit selection is needed for an unsupported native lane.",
             "lib_dirs": [],
+        }
+
+    if platform.system() == "Windows":
+        detected = detect_cuda_toolkit("Windows", os.environ)
+        if detected.get("ready"):
+            nvcc_version = _read_nvcc_release(Path(str(detected["nvcc_path"])))
+            return {
+                "desired_cuda_label": label,
+                "toolkit_root": detected.get("toolkit_root"),
+                "include_dir": str(Path(str(detected["toolkit_root"])) / "include"),
+                "nvcc_path": detected.get("nvcc_path"),
+                "nvcc_version": nvcc_version,
+                "status": "matched",
+                "reason": f"Selected Windows CUDA toolkit from {detected.get('source')} for readiness/probe compatibility.",
+                "lib_dirs": list(detected.get("lib_dirs") or []),
+            }
+        return {
+            "desired_cuda_label": label,
+            "toolkit_root": None,
+            "include_dir": None,
+            "nvcc_path": None,
+            "nvcc_version": None,
+            "status": "blocked",
+            "reason": str(detected.get("reason")),
+            "lib_dirs": [],
+            "next_action": detected.get("next_action"),
         }
 
     candidates: list[tuple[Path, str, bool]] = []
@@ -1299,8 +1332,8 @@ def _native_common_build_env(*, toolkit: dict[str, Any], venv_dir: Path | None =
                 "CPATH": _join_path_entries(include_dir, os.environ.get("CPATH"), blocked=blocked_include_paths),
                 "C_INCLUDE_PATH": _join_path_entries(include_dir, os.environ.get("C_INCLUDE_PATH"), blocked=blocked_include_paths),
                 "CPLUS_INCLUDE_PATH": _join_path_entries(include_dir, os.environ.get("CPLUS_INCLUDE_PATH"), blocked=blocked_include_paths),
-                "LIBRARY_PATH": _join_path_entries(":".join(ld_entries), os.environ.get("LIBRARY_PATH"), blocked=blocked_library_paths),
-                "LD_LIBRARY_PATH": _join_path_entries(":".join(ld_entries), os.environ.get("LD_LIBRARY_PATH"), blocked=blocked_library_paths),
+                "LIBRARY_PATH": _join_path_entries(os.pathsep.join(ld_entries), os.environ.get("LIBRARY_PATH"), blocked=blocked_library_paths),
+                "LD_LIBRARY_PATH": _join_path_entries(os.pathsep.join(ld_entries), os.environ.get("LD_LIBRARY_PATH"), blocked=blocked_library_paths),
                 "CPPFLAGS": _prepend_flag(f"-isystem {include_dir}", os.environ.get("CPPFLAGS")),
                 "CFLAGS": _prepend_flag(f"-isystem {include_dir}", os.environ.get("CFLAGS")),
                 "CXXFLAGS": _prepend_flag(f"-isystem {include_dir}", os.environ.get("CXXFLAGS")),

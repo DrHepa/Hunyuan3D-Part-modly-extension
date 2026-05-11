@@ -32,7 +32,11 @@
     "hf_repo": "tencent/Hunyuan3D-Part",
     "download_check": "p3sam/p3sam.safetensors",
     "weight_owner_id": "p3sam",
-    "workflow_constraint": "Primary workflow input must remain image or text; mesh is exposed as a required secondary named input."
+    "workflow_constraint": "Primary workflow input must remain image or text; mesh is exposed as a required secondary named input.",
+    "windows_setup_readiness": "compatible-for-setup-and-readiness-probes",
+    "windows_inference_requires_native_probe": true,
+    "public_release_readiness": "Windows release metadata is readiness/setup compatible; full Windows NVIDIA inference is not advertised until CUDA and native dependency probes pass on the target host.",
+    "inference_support_contract": "fail-closed-until-platform-cuda-native-wheels-runtime-dependencies-and-weights-are-ready"
   },
   "setup": {
     "kind": "python-root-setup-py",

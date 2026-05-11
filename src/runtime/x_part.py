@@ -13,6 +13,7 @@ from typing import Iterable
 from .config import NormalizedParams, resolve_x_part_resource_limits
 from .errors import RuntimeFailure, SetupFailure
 from .export import DecompositionArtifacts, PartArtifact
+from .platform_support import build_runtime_env, memory_guard_status, subprocess_command
 from .p3_sam import ExecutionPlan, SubprocessRunner, runtime_source_root
 
 X_PART_PIPELINE_RELATIVE_PATH = Path("XPart") / "partgen" / "partformer_pipeline.py"
@@ -129,6 +130,10 @@ def verify_x_part_import_smoke(*, project_root: Path, managed_python: Path, mode
             "import json",
             "import sys",
             "from pathlib import Path",
+            "try:",
+            "    import torch  # import first so Windows DLL paths are initialized before upstream imports",
+            "except Exception:",
+            "    pass",
             f"pipeline_path = Path({str(pipeline_path)!r})",
             f"import_root = Path({str(import_root)!r})",
             "sys.path.insert(0, str(import_root))",
@@ -147,7 +152,7 @@ def verify_x_part_import_smoke(*, project_root: Path, managed_python: Path, mode
         ]
     )
     result = subprocess.run(
-        [str(managed_python), "-c", script],
+        subprocess_command(managed_python, "-c", script),
         check=False,
         capture_output=True,
         text=True,
@@ -345,6 +350,15 @@ def _read_mem_available_gib(meminfo_path: Path = Path("/proc/meminfo")) -> float
     return None
 
 
+def _read_fallback_mem_available_gib() -> float | None:
+    try:
+        import psutil  # type: ignore
+
+        return psutil.virtual_memory().available / (1024**3)
+    except Exception:
+        return None
+
+
 def _run_with_memory_guard(
     command: list[str],
     *,
@@ -365,6 +379,12 @@ def _run_with_memory_guard(
     lowest_available_gib: float | None = None
     while process.poll() is None:
         available_gib = _read_mem_available_gib()
+        guard_source = "/proc/meminfo"
+        guard_status = "enforced"
+        if available_gib is None:
+            available_gib = _read_fallback_mem_available_gib()
+            guard_source = "psutil.virtual_memory" if available_gib is not None else None
+            guard_status = "fallback" if available_gib is not None else "degraded"
         if available_gib is not None:
             lowest_available_gib = available_gib if lowest_available_gib is None else min(lowest_available_gib, available_gib)
             if min_available_gib > 0 and available_gib < min_available_gib:
@@ -382,6 +402,9 @@ def _run_with_memory_guard(
                     subprocess.CompletedProcess(command, process.returncode if process.returncode is not None else -9, stdout, (stderr or "") + message),
                     {
                         "triggered": True,
+                        "guard_status": guard_status,
+                        "source": guard_source,
+                        "enforced": True,
                         "available_gib": round(available_gib, 3),
                         "threshold_gib": round(min_available_gib, 3),
                         "lowest_available_gib": round(lowest_available_gib, 3) if lowest_available_gib is not None else None,
@@ -401,6 +424,8 @@ def _run_with_memory_guard(
         subprocess.CompletedProcess(command, process.returncode if process.returncode is not None else 0, stdout, stderr),
         {
             "triggered": False,
+            "guard_status": memory_guard_status().get("guard_status") if lowest_available_gib is None else "enforced",
+            "enforced": bool(lowest_available_gib is not None or memory_guard_status().get("enforced", False)),
             "threshold_gib": round(min_available_gib, 3),
             "lowest_available_gib": round(lowest_available_gib, 3) if lowest_available_gib is not None else None,
         },
@@ -650,8 +675,12 @@ def run_upstream_x_part(
         params=plan.params,
         aabb_path=aabb_path,
     )
-    command = [str(managed_python), "-c", script]
-    subprocess_env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"}
+    command = subprocess_command(managed_python, "-c", script)
+    subprocess_env = build_runtime_env(
+        os.environ,
+        pythonpath=(runtime_root, x_part_import_root(runtime_root / X_PART_PIPELINE_RELATIVE_PATH)),
+        extra={"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"},
+    )
     memory_guard: dict[str, object] | None = None
     try:
         if runner is subprocess.run:

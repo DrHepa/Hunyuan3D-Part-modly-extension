@@ -25,6 +25,7 @@ except ImportError:  # pragma: no cover - exercised in local tests only
 from runtime.config import evaluate_host_support, probe_torch_cuda_availability, resolve_host_facts, resolve_runtime_context
 from runtime.config import normalize_params
 from runtime.errors import RuntimeFailure, ValidationError
+from runtime.platform_support import managed_python_path
 from runtime.pipeline import run_pipeline_stage
 from runtime.p3_sam import build_adapter_readiness, decompose_mesh, resolve_weight_path
 from runtime.semantic_report import build_image_evidence
@@ -61,9 +62,7 @@ class Hunyuan3DPartGenerator(BaseGenerator):
         return Path(model_dir)
 
     def _managed_venv_python(self) -> Path:
-        if os.name == "nt":
-            return self.project_root / "venv" / "Scripts" / "python.exe"
-        return self.project_root / "venv" / "bin" / "python"
+        return managed_python_path(self.project_root / "venv")
 
     def _setup_ready(self) -> bool:
         managed_python = self._managed_venv_python().resolve()
@@ -174,6 +173,12 @@ class Hunyuan3DPartGenerator(BaseGenerator):
             "execution_ready": adapter_ready,
             "inference_ready": adapter_ready,
             "host_support": host_support,
+            "platform_supported": bool(host_support.get("platform_supported", True)),
+            "cuda_ready": bool(host_support.get("cuda_ready", False)),
+            "native_wheels_ready": bool(host_support.get("native_wheels_ready", False)),
+            "runtime_dependencies_ready": bool(host_support.get("runtime_dependencies_ready", False)),
+            "inference_supported": bool(host_support.get("inference_supported", False)),
+            "diagnostics": host_support.get("diagnostics", {}),
             "setup": setup_status,
             "runtime_adapter": adapter_readiness.to_dict(),
             "weights": weights_status,
@@ -196,6 +201,7 @@ class Hunyuan3DPartGenerator(BaseGenerator):
                 "details": {
                     "blocker_count": len(blockers),
                     "host_support_ready": bool(host_support.get("ready", False)),
+                    "inference_supported": bool(host_support.get("inference_supported", False)),
                     "setup_ready": setup_ready,
                     "adapter_ready": bool(readiness["runtime_adapter"].get("ready", False)),
                     "weights_ready": weights_ready,

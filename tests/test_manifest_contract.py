@@ -41,6 +41,10 @@ class ManifestContractTests(unittest.TestCase):
         self.assertEqual(metadata["download_check"], "p3sam/p3sam.safetensors")
         self.assertEqual(metadata["weight_owner_id"], "p3sam")
         self.assertIn("Primary workflow input", metadata["workflow_constraint"])
+        self.assertEqual(metadata["windows_setup_readiness"], "compatible-for-setup-and-readiness-probes")
+        self.assertTrue(metadata["windows_inference_requires_native_probe"])
+        self.assertIn("full Windows NVIDIA inference is not advertised", metadata["public_release_readiness"])
+        self.assertIn("fail-closed", metadata["inference_support_contract"])
 
     def test_node_schema_uses_image_primary_and_required_mesh_secondary(self) -> None:
         node = self.manifest["nodes"][0]

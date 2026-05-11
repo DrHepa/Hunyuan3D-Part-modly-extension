@@ -13,6 +13,7 @@ from typing import Callable, Mapping
 from .config import DEFAULT_MAX_PARTS, NormalizedParams, RuntimeContext, new_run_id, normalize_params, raise_for_support, resolve_runtime_context
 from .errors import RuntimeFailure, SetupFailure
 from .export import DecompositionArtifacts, export_bundle
+from .platform_support import build_runtime_env, subprocess_command
 from .validate import ValidatedMeshRequest, validate_inputs
 
 MODEL_WEIGHT_RELATIVE_PATH = Path("p3sam") / "p3sam.safetensors"
@@ -48,13 +49,16 @@ class ExecutionPlan:
     image_evidence: Mapping[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
+        support = self.context.support.to_dict()
+        support.pop("diagnostics", None)
+        support.pop("resource_limits", None)
         payload: dict[str, object] = {
             "mesh": str(self.mesh.mesh_path),
             "mesh_format": self.mesh.mesh_format,
             "params": self.params.to_dict(),
             "run_id": self.run_id,
             "host": self.context.host_facts.to_dict(),
-            "support": self.context.support.to_dict(),
+            "support": support,
         }
         if self.image_evidence is not None:
             payload["image_evidence"] = dict(self.image_evidence)
@@ -207,6 +211,10 @@ def verify_upstream_import_smoke(
             "import pathlib",
             "import sys",
             "import traceback",
+            "try:",
+            "    import torch  # import first so Windows DLL paths are initialized before upstream imports",
+            "except Exception:",
+            "    pass",
             f"model_path = pathlib.Path({str(model_path)!r})",
             "payload = {'ready': False, 'python_exe': sys.executable, 'module': str(model_path)}",
             "try:",
@@ -228,7 +236,7 @@ def verify_upstream_import_smoke(
     env["PYTHONUNBUFFERED"] = "1"
     env[SONATA_CACHE_ENV_VAR] = str(cache_root)
     result = subprocess.run(
-        [str(managed_python), "-c", script],
+        subprocess_command(managed_python, "-c", script),
         check=False,
         capture_output=True,
         text=True,
@@ -344,15 +352,15 @@ def build_subprocess_command(
     output_dir: Path,
     params: NormalizedParams,
 ) -> list[str]:
-    command = [
-        str(managed_python),
-        str(entrypoint),
+    command = subprocess_command(
+        managed_python,
+        entrypoint,
         "--ckpt_path",
-        str(weights),
+        weights,
         "--mesh_path",
-        str(mesh_path),
+        mesh_path,
         "--output_path",
-        str(output_dir),
+        output_dir,
         "--seed",
         str(params.seed if params.seed is not None else 42),
         "--prompt_bs",
@@ -367,7 +375,7 @@ def build_subprocess_command(
         "0",
         "--parallel",
         "0",
-    ]
+    )
     return command
 
 
@@ -588,10 +596,11 @@ def run_upstream_p3_sam(
         output_dir=output_dir,
         params=plan.params,
     )
-    env = os.environ.copy()
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env.setdefault("PYTHONUNBUFFERED", "1")
-    env[SONATA_CACHE_ENV_VAR] = str(sonata_cache_root(project_root))
+    env = build_runtime_env(
+        os.environ,
+        pythonpath=(runtime_source_root(project_root),),
+        extra={"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1", SONATA_CACHE_ENV_VAR: str(sonata_cache_root(project_root))},
+    )
     result = runner(
         command,
         check=False,

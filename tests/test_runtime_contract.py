@@ -33,6 +33,15 @@ from runtime.config import (
 from runtime.errors import RuntimeFailure, SetupFailure, ValidationError
 from runtime.export import DecompositionArtifacts, PartArtifact
 from runtime.pipeline import _require_p3_sam_aabb, run_pipeline_stage
+from runtime.platform_support import (
+    build_runtime_env,
+    detect_cuda_toolkit,
+    managed_pip_path,
+    managed_python_path,
+    memory_guard_status,
+    probe_native_dependencies,
+    subprocess_command,
+)
 from runtime.p3_sam import (
     AdapterReadiness,
     SONATA_CACHE_ENV_VAR,
@@ -166,6 +175,62 @@ class RuntimeContractTests(unittest.TestCase):
             facts = resolve_host_facts(env={})
 
         self.assertTrue(facts.cuda_visible)
+
+    def test_managed_venv_resolver_uses_platform_specific_layouts(self) -> None:
+        venv = self.workspace / "venv with spaces"
+
+        self.assertEqual(managed_python_path(venv, "Linux"), venv / "bin" / "python")
+        self.assertEqual(managed_pip_path(venv, "Linux"), venv / "bin" / "pip")
+        self.assertEqual(managed_python_path(venv, "Windows"), venv / "Scripts" / "python.exe")
+        self.assertEqual(managed_pip_path(venv, "Windows"), venv / "Scripts" / "pip.exe")
+
+    def test_runtime_env_uses_os_pathsep_for_path_composition(self) -> None:
+        env = build_runtime_env(
+            {"PATH": os.pathsep.join(["/usr/bin", "/bin"]), "PYTHONPATH": "existing"},
+            prepend_path=[self.workspace / "venv with spaces" / "bin"],
+            pythonpath=[self.workspace / "src with spaces"],
+        )
+
+        self.assertEqual(env["PATH"].split(os.pathsep)[0], str(self.workspace / "venv with spaces" / "bin"))
+        self.assertEqual(env["PYTHONPATH"].split(os.pathsep)[0], str(self.workspace / "src with spaces"))
+
+    def test_windows_cuda_detection_uses_cuda_path_layout(self) -> None:
+        cuda_root = self.workspace / "CUDA Toolkit"
+        (cuda_root / "bin").mkdir(parents=True)
+        (cuda_root / "include").mkdir()
+        (cuda_root / "lib" / "x64").mkdir(parents=True)
+        (cuda_root / "bin" / "nvcc.exe").write_text("", encoding="utf-8")
+        (cuda_root / "include" / "cuda.h").write_text("", encoding="utf-8")
+
+        detected = detect_cuda_toolkit("Windows", {"CUDA_PATH": str(cuda_root)})
+
+        self.assertTrue(detected["ready"])
+        self.assertEqual(detected["source"], "CUDA_PATH")
+        self.assertEqual(detected["nvcc_path"], str(cuda_root / "bin" / "nvcc.exe"))
+        self.assertIn(str(cuda_root / "lib" / "x64"), detected["lib_dirs"])
+
+    def test_native_dependency_probe_fails_closed_when_required_imports_missing(self) -> None:
+        missing_python = self.workspace / "venv" / "bin" / "python"
+
+        probe = probe_native_dependencies(missing_python)
+
+        self.assertFalse(probe["ready"])
+        self.assertEqual(probe["status"], "pending")
+        self.assertIn("Managed Python is missing", probe["reason"])
+
+    def test_subprocess_command_keeps_paths_with_spaces_as_list_arguments(self) -> None:
+        command = subprocess_command(self.workspace / "venv with spaces" / "bin" / "python", "-c", "print('ok')")
+
+        self.assertIsInstance(command, list)
+        self.assertEqual(command[0], str(self.workspace / "venv with spaces" / "bin" / "python"))
+        self.assertNotIn('"', command[0])
+
+    def test_memory_guard_reports_degraded_when_proc_and_psutil_are_unavailable(self) -> None:
+        with mock.patch.dict(sys.modules, {"psutil": None}):
+            status = memory_guard_status("Windows", proc_meminfo=self.workspace / "missing-meminfo")
+
+        self.assertEqual(status["guard_status"], "degraded")
+        self.assertFalse(status["enforced"])
 
     def test_host_support_stays_blocked_without_cuda_env_or_torch_cuda(self) -> None:
         with mock.patch("runtime.config.probe_torch_cuda_availability", return_value=False):
