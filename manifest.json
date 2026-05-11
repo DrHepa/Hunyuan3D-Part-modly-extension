@@ -62,6 +62,10 @@
       "weight_owner_id": "p3sam",
       "input_mode": "image-conditioned-mesh",
       "inputs": [
+        "image",
+        "mesh"
+      ],
+      "input_contract": [
         {
           "name": "front",
           "type": "image",
@@ -85,7 +89,7 @@
           ]
         }
       ],
-      "outputs": [
+      "output_contract": [
         {
           "name": "mesh",
           "type": "mesh",

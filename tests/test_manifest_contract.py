@@ -55,17 +55,19 @@ class ManifestContractTests(unittest.TestCase):
         self.assertEqual(node["hf_repo"], "tencent/Hunyuan3D-Part")
         self.assertEqual(node["download_check"], "p3sam/p3sam.safetensors")
         self.assertEqual(node["weight_owner_id"], "p3sam")
-        self.assertEqual(len(node["inputs"]), 2)
-        self.assertEqual(node["inputs"][0]["name"], "front")
-        self.assertEqual(node["inputs"][0]["type"], "image")
-        self.assertFalse(node["inputs"][0]["required"])
-        self.assertEqual(node["inputs"][1]["name"], "mesh")
-        self.assertEqual(node["inputs"][1]["type"], "mesh")
-        self.assertTrue(node["inputs"][1]["required"])
-        self.assertEqual(node["inputs"][1]["formats"], ["glb", "obj", "stl", "ply"])
-        self.assertEqual(len(node["outputs"]), 1)
-        self.assertTrue(node["outputs"][0]["primary"])
-        self.assertEqual(node["outputs"][0]["formats"], ["glb"])
+        self.assertEqual(node["inputs"], ["image", "mesh"])
+        self.assertNotIn("outputs", node)
+        self.assertEqual(len(node["input_contract"]), 2)
+        self.assertEqual(node["input_contract"][0]["name"], "front")
+        self.assertEqual(node["input_contract"][0]["type"], "image")
+        self.assertFalse(node["input_contract"][0]["required"])
+        self.assertEqual(node["input_contract"][1]["name"], "mesh")
+        self.assertEqual(node["input_contract"][1]["type"], "mesh")
+        self.assertTrue(node["input_contract"][1]["required"])
+        self.assertEqual(node["input_contract"][1]["formats"], ["glb", "obj", "stl", "ply"])
+        self.assertEqual(len(node["output_contract"]), 1)
+        self.assertTrue(node["output_contract"][0]["primary"])
+        self.assertEqual(node["output_contract"][0]["formats"], ["glb"])
         self.assertEqual(
             node["defaults"],
             {
@@ -90,6 +92,14 @@ class ManifestContractTests(unittest.TestCase):
         export_param = next(item for item in node["params_schema"] if item["id"] == "export_format")
         self.assertEqual(export_param["options"], [{"value": "glb", "label": "GLB"}])
         self.assertEqual(node["params"]["export_format"]["enum"], ["glb"])
+
+    def test_node_inputs_are_renderer_safe_strings(self) -> None:
+        node = self.manifest["nodes"][0]
+
+        self.assertTrue(all(isinstance(item, str) for item in node["inputs"]))
+        self.assertNotIn("outputs", node)
+        self.assertIn("input_contract", node)
+        self.assertIn("output_contract", node)
 
     def test_semantic_report_sidecar_is_statically_discoverable(self) -> None:
         node = self.manifest["nodes"][0]
