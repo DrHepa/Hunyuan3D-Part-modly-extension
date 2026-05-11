@@ -36,6 +36,8 @@ SETUP_SUMMARY_NAME = ".modly-setup-summary.json"
 NATIVE_BUILD_ARTIFACTS_DIRNAME = ".modly/native-build-artifacts"
 TORCH_SCATTER_VERSION = "2.1.2"
 TORCH_CLUSTER_VERSION = "1.6.3"
+WINDOWS_PYG_CU124_INDEX_URL = "https://data.pyg.org/whl/torch-2.5.0+cu124.html"
+WINDOWS_SPCONV_CU120_PACKAGE = "spconv-cu120==2.3.6"
 RUNTIME_PACKAGES = [
     "numpy",
     "trimesh",
@@ -1064,6 +1066,10 @@ def _is_linux_arm64(system_name: str, machine: str) -> bool:
     return system_name == "Linux" and normalize_machine(machine) == "arm64"
 
 
+def _is_windows_amd64(system_name: str, machine: str) -> bool:
+    return system_name == "Windows" and normalize_machine(machine) == "x86_64"
+
+
 def _native_required_imports() -> tuple[str, ...]:
     return ("spconv.pytorch", "torch_scatter", "torch_cluster")
 
@@ -1446,6 +1452,47 @@ def _linux_arm64_native_install_steps(*, gpu_sm: int, toolkit: dict[str, Any], v
     )
 
 
+def _windows_amd64_native_install_steps() -> tuple[NativeInstallStep, ...]:
+    return (
+        NativeInstallStep(
+            package="torch_scatter",
+            requirement=f"torch-scatter=={TORCH_SCATTER_VERSION}+pt25cu124",
+            strategy="pip-prebuilt-wheel",
+            status="planned",
+            pip_args=(
+                "install",
+                f"torch-scatter=={TORCH_SCATTER_VERSION}+pt25cu124",
+                "-f",
+                WINDOWS_PYG_CU124_INDEX_URL,
+                "--no-cache-dir",
+            ),
+            reason="Windows AMD64 uses PyG prebuilt wheels for PyTorch 2.5 / CUDA 12.4 instead of source builds.",
+        ),
+        NativeInstallStep(
+            package="torch_cluster",
+            requirement=f"torch-cluster=={TORCH_CLUSTER_VERSION}+pt25cu124",
+            strategy="pip-prebuilt-wheel",
+            status="planned",
+            pip_args=(
+                "install",
+                f"torch-cluster=={TORCH_CLUSTER_VERSION}+pt25cu124",
+                "-f",
+                WINDOWS_PYG_CU124_INDEX_URL,
+                "--no-cache-dir",
+            ),
+            reason="Windows AMD64 uses PyG prebuilt wheels for PyTorch 2.5 / CUDA 12.4 instead of source builds.",
+        ),
+        NativeInstallStep(
+            package="spconv",
+            requirement=WINDOWS_SPCONV_CU120_PACKAGE,
+            strategy="pip-prebuilt-wheel",
+            status="planned",
+            pip_args=("install", WINDOWS_SPCONV_CU120_PACKAGE, "--no-cache-dir"),
+            reason="spconv-cu120 publishes cp311/cp312 Windows AMD64 wheels and imports as the spconv module.",
+        ),
+    )
+
+
 def _normalize_native_mode(value: Any) -> str:
     normalized = str(value or NATIVE_MODE_AUTO).strip().lower()
     if normalized not in SUPPORTED_NATIVE_MODES:
@@ -1516,6 +1563,14 @@ def build_native_runtime_plan(
             "Linux ARM64 native dependency planning requires an NVIDIA CUDA host with gpu_sm >= 70 for the "
             f"validated base-runtime lanes. Received gpu_sm={gpu_sm} cuda_version={cuda_version}."
         )
+    elif _is_windows_amd64(system_name, normalized_machine):
+        lane = "windows-amd64-cu124-prebuilt"
+        desired_cuda_label = "cu124"
+        state = SUPPORTED
+        reason = (
+            "Windows AMD64 uses prebuilt PyG CUDA 12.4 wheels plus spconv-cu120; "
+            "runtime inference still depends on the managed import smoke passing on the target host."
+        )
 
     host = NativeHostLane(
         system=system_name,
@@ -1530,7 +1585,16 @@ def build_native_runtime_plan(
     )
     toolkit = resolve_cuda_toolkit_for_label(desired_cuda_label)
     resolved_venv_dir = venv_dir or (ROOT / "venv")
-    if state == SUPPORTED:
+    if state == SUPPORTED and lane == "windows-amd64-cu124-prebuilt":
+        install_strategy = "windows-amd64-prebuilt-wheels"
+        install_steps = _windows_amd64_native_install_steps()
+        message = (
+            "Windows AMD64 native runtime uses prebuilt wheels and may be installed automatically during managed setup."
+        )
+        next_action = "Run managed setup/repair again; it will install Windows prebuilt native wheels and re-probe readiness."
+        plan_status = "planned"
+        automatic_install_supported = True
+    elif state == SUPPORTED:
         install_strategy = "linux-arm64-source-build"
         install_steps = _linux_arm64_native_install_steps(gpu_sm=gpu_sm, toolkit=toolkit, venv_dir=resolved_venv_dir) if toolkit["status"] == "matched" else (
             NativeInstallStep(
@@ -3526,7 +3590,14 @@ def run_native_runtime_phase(
     message = probe.message
     next_action = probe.next_action
 
-    if resolved_mode == NATIVE_MODE_INSTALL and not probe.ready:
+    auto_prebuilt_install = (
+        resolved_mode == NATIVE_MODE_AUTO
+        and plan.automatic_install_supported
+        and plan.install_strategy == "windows-amd64-prebuilt-wheels"
+        and not probe.ready
+    )
+
+    if (resolved_mode == NATIVE_MODE_INSTALL or auto_prebuilt_install) and not probe.ready:
         if not plan.automatic_install_supported:
             status = "blocked"
             message = plan.message
@@ -3558,7 +3629,7 @@ def run_native_runtime_phase(
                         "Fix the failing native build prerequisite or dependency step, then retry native_mode=install explicitly."
                     )
                     break
-                if step.package == "cumm":
+                if step.package == "cumm" and plan.install_strategy == "linux-arm64-source-build":
                     repair_result = cumm_header_repairer(venv_dir=venv_dir, extension_dir=venv_dir.parent)
                     install_results.append(repair_result)
                     if repair_result.get("status") not in {"already_present", "repaired"}:
@@ -3648,7 +3719,7 @@ def run_native_runtime_phase(
                             "Inspect the managed cumm/common.py CUDA resolver and retry native_mode=install explicitly before attempting spconv.",
                         )
                         break
-                if step.package == "spconv":
+                if step.package == "spconv" and plan.install_strategy == "linux-arm64-source-build":
                     validation_result = spconv_core_validator(managed_python=managed_python)
                     install_results.append(validation_result)
                     if not validation_result.get("ready", False):

@@ -795,6 +795,39 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
         self.assertNotIn("CUMM_DISABLE_JIT", plan.install_steps[4].env)
         self.assertEqual(plan.install_steps[4].reason, plan.install_steps[3].reason)
 
+    def test_build_native_runtime_plan_marks_windows_amd64_prebuilt_lane_supported(self) -> None:
+        plan = self.setup.build_native_runtime_plan(
+            system_name="Windows",
+            machine="AMD64",
+            py_tag="cp311",
+            gpu_sm=89,
+            cuda_version=124,
+            native_mode="auto",
+            venv_dir=Path("C:/Users/franc/Tools/Modly/extensions/hunyuan3d-part/venv"),
+        )
+
+        self.assertEqual(plan.host.lane, "windows-amd64-cu124-prebuilt")
+        self.assertEqual(plan.host.state, "supported")
+        self.assertEqual(plan.desired_cuda_label, "cu124")
+        self.assertEqual(plan.install_strategy, "windows-amd64-prebuilt-wheels")
+        self.assertTrue(plan.automatic_install_supported)
+        self.assertEqual([step.package for step in plan.install_steps], ["torch_scatter", "torch_cluster", "spconv"])
+        self.assertEqual(plan.install_steps[0].pip_args, (
+            "install",
+            "torch-scatter==2.1.2+pt25cu124",
+            "-f",
+            "https://data.pyg.org/whl/torch-2.5.0+cu124.html",
+            "--no-cache-dir",
+        ))
+        self.assertEqual(plan.install_steps[1].pip_args, (
+            "install",
+            "torch-cluster==1.6.3+pt25cu124",
+            "-f",
+            "https://data.pyg.org/whl/torch-2.5.0+cu124.html",
+            "--no-cache-dir",
+        ))
+        self.assertEqual(plan.install_steps[2].pip_args, ("install", "spconv-cu120==2.3.6", "--no-cache-dir"))
+
     def test_build_native_runtime_plan_uses_linux_arm64_source_build_for_cu124_lane(self) -> None:
         venv_dir = Path("/tmp/native-plan-cu124")
         with (
@@ -2228,6 +2261,106 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
         self.assertFalse(result["attempted_install"])
         self.assertEqual(result["mode"], "auto")
         self.assertEqual(result["install_strategy"], "linux-arm64-source-build")
+
+    def test_run_native_runtime_phase_auto_installs_windows_prebuilt_wheels(self) -> None:
+        plan = self.setup.NativeRuntimePlan(
+            native_mode="auto",
+            host=self.setup.NativeHostLane(
+                system="Windows",
+                machine="x86_64",
+                platform_key="windows/x86_64",
+                python_tag="cp311",
+                gpu_sm=89,
+                cuda_version=124,
+                lane="windows-amd64-cu124-prebuilt",
+                state="supported",
+                reason="windows prebuilt",
+            ),
+            desired_cuda_label="cu124",
+            toolkit_root=None,
+            toolkit_include_dir=None,
+            toolkit_nvcc=None,
+            nvcc_version=None,
+            toolkit_status="not_required",
+            toolkit_reason="prebuilt wheels",
+            required_imports=("spconv.pytorch", "torch_scatter", "torch_cluster"),
+            related_packages=("cumm",),
+            install_steps=(
+                self.setup.NativeInstallStep(
+                    package="torch_scatter",
+                    requirement="torch-scatter==2.1.2+pt25cu124",
+                    strategy="pip-prebuilt-wheel",
+                    status="planned",
+                    pip_args=("install", "torch-scatter==2.1.2+pt25cu124"),
+                ),
+                self.setup.NativeInstallStep(
+                    package="torch_cluster",
+                    requirement="torch-cluster==1.6.3+pt25cu124",
+                    strategy="pip-prebuilt-wheel",
+                    status="planned",
+                    pip_args=("install", "torch-cluster==1.6.3+pt25cu124"),
+                ),
+                self.setup.NativeInstallStep(
+                    package="spconv",
+                    requirement="spconv-cu120==2.3.6",
+                    strategy="pip-prebuilt-wheel",
+                    status="planned",
+                    pip_args=("install", "spconv-cu120==2.3.6"),
+                ),
+            ),
+            install_strategy="windows-amd64-prebuilt-wheels",
+            automatic_install_supported=True,
+            status="planned",
+            message="install prebuilt",
+            next_action="install",
+        )
+        blocked_probe = self.setup.NativeRuntimeProbe(
+            ready=False,
+            status="blocked",
+            managed_python="C:/tmp/python.exe",
+            imports={},
+            missing_modules=("spconv", "torch_scatter", "torch_cluster"),
+            blocked_imports=("spconv", "torch_scatter", "torch_cluster"),
+            message="blocked",
+            next_action="repair",
+        )
+        ready_probe = self.setup.NativeRuntimeProbe(
+            ready=True,
+            status="ready",
+            managed_python="C:/tmp/python.exe",
+            imports={"spconv": {"ready": True}, "torch_scatter": {"ready": True}, "torch_cluster": {"ready": True}},
+            missing_modules=(),
+            blocked_imports=(),
+            message="ready",
+            next_action="none",
+        )
+
+        with (
+            mock.patch.object(self.setup, "build_native_runtime_plan", return_value=plan),
+            mock.patch.object(self.setup, "probe_native_runtime", side_effect=[blocked_probe, ready_probe]) as probe_mock,
+        ):
+            installer = mock.Mock(side_effect=[
+                {"package": "torch_scatter", "status": "installed"},
+                {"package": "torch_cluster", "status": "installed"},
+                {"package": "spconv", "status": "installed"},
+            ])
+            result = self.setup.run_native_runtime_phase(
+                venv_dir=Path("C:/tmp/venv"),
+                managed_python=Path("C:/tmp/python.exe"),
+                system_name="Windows",
+                machine="AMD64",
+                py_tag="cp311",
+                gpu_sm=89,
+                cuda_version=124,
+                native_mode="auto",
+                installer=installer,
+            )
+
+        self.assertEqual(probe_mock.call_count, 2)
+        self.assertTrue(result["attempted_install"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["install_strategy"], "windows-amd64-prebuilt-wheels")
+        self.assertEqual([call.kwargs["step"].package for call in installer.call_args_list], ["torch_scatter", "torch_cluster", "spconv"])
 
     def test_run_native_runtime_phase_install_can_use_monkeypatched_runner(self) -> None:
         plan = self.setup.NativeRuntimePlan(
