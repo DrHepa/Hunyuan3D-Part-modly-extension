@@ -215,6 +215,9 @@ class Hunyuan3DPartGenerator(BaseGenerator):
 
     def _collect_runtime_blockers(self, readiness: Mapping[str, object]) -> list[dict[str, object]]:
         blockers: list[dict[str, object]] = []
+        setup = readiness["setup"]
+        weights = readiness["weights"]
+        runtime_adapter = readiness["runtime_adapter"]
         for key in ("setup", "weights"):
             section = readiness[key]
             if isinstance(section, Mapping) and not bool(section.get("ready", False)):
@@ -222,7 +225,15 @@ class Hunyuan3DPartGenerator(BaseGenerator):
                     continue
                 blockers.append({"component": key, **dict(section)})
         host_support = readiness["host_support"]
-        if isinstance(host_support, Mapping) and not bool(host_support.get("ready", False)):
+        managed_runtime_ready = (
+            isinstance(setup, Mapping)
+            and bool(setup.get("ready", False))
+            and isinstance(weights, Mapping)
+            and bool(weights.get("ready", False))
+            and isinstance(runtime_adapter, Mapping)
+            and bool(runtime_adapter.get("ready", False))
+        )
+        if isinstance(host_support, Mapping) and not bool(host_support.get("ready", False)) and not managed_runtime_ready:
             blocker = {"component": "host_support", **dict(host_support)}
             blockers.append(blocker)
         for key in ("runtime_adapter",):

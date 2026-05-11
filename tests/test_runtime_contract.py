@@ -1620,6 +1620,58 @@ class RuntimeContractTests(unittest.TestCase):
         for forbidden in ("base64", "image_path", "path", "hash", "sidecar"):
             self.assertNotIn(forbidden, encoded)
 
+    def test_generator_generate_treats_parent_host_support_as_diagnostic_when_managed_adapter_is_ready(self) -> None:
+        blocked_parent_context = resolve_runtime_context(
+            project_root=self.workspace,
+            host_facts=HostFacts(
+                os_name="windows",
+                arch="amd64",
+                python_version="3.11.8",
+                python_abi="cp311",
+                cuda_visible=False,
+            ),
+            dependency_checker=lambda _: object(),
+        )
+        managed_python = self.workspace / "venv" / "bin" / "python"
+        managed_python.parent.mkdir(parents=True, exist_ok=True)
+        managed_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        weight_path = self.injected_model_dir / "p3sam.safetensors"
+        weight_path.write_bytes(b"weights")
+        adapter_readiness = AdapterReadiness(
+            ready=True,
+            status="ready",
+            paths=None,
+            components={
+                "managed_python": {"ready": True, "status": "ready"},
+                "runtime_source": {"ready": True, "status": "ready"},
+                "entrypoint": {"ready": True, "status": "ready"},
+                "import_smoke": {"ready": True, "status": "ready"},
+                "weights": {"ready": True, "status": "ready", "path": str(weight_path)},
+            },
+            message="Runtime adapter ready.",
+        )
+        generator = Hunyuan3DPartGenerator(
+            self.injected_model_dir,
+            self.workspace,
+            project_root=self.workspace,
+            runtime_context=blocked_parent_context,
+        )
+
+        with (
+            mock.patch("generator.probe_torch_cuda_availability", return_value=False),
+            mock.patch("generator.build_adapter_readiness", return_value=adapter_readiness),
+            mock.patch("generator.decompose_mesh", return_value={"primary_mesh": str(self.mesh), "status": "ok"}) as decompose_mock,
+        ):
+            readiness = generator.readiness_status()
+            result = generator.generate(b"image-bytes", {"mesh_path": str(self.mesh)})
+
+        self.assertTrue(readiness["ok"])
+        self.assertEqual(readiness["machine_code"], "ready")
+        self.assertEqual(readiness["host_support"]["status"], "blocked")
+        self.assertEqual(readiness["blockers"], [])
+        self.assertEqual(result, str(self.mesh))
+        decompose_mock.assert_called_once()
+
     def test_generator_progress_callback_prefers_modly_two_arg_contract(self) -> None:
         generator = Hunyuan3DPartGenerator(
             self.injected_model_dir,
