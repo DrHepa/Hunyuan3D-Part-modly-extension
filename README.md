@@ -22,7 +22,7 @@ The extension is an integration layer for Modly. It is not a standalone redistri
 
 - **Linux NVIDIA:** validated locally for the current adapter/runtime path. Recent local validation reported `214 passed, 12 subtests passed` after Windows-readiness promotion.
 - **Windows:** setup and readiness metadata are compatible and fail closed. Full Windows NVIDIA inference is **not** advertised until CUDA, native dependency, runtime, and weight probes pass on a real target host.
-- **Linux ARM64 / DGX Spark:** experimental and locally validated in limited conditions, with elevated native dependency risk. Treat this path as platform-sensitive until reproduced on the target environment.
+- **Linux ARM64:** experimental and locally validated in limited conditions, with elevated native dependency risk. Treat this path as platform-sensitive until reproduced on the target environment.
 
 ## Usage in Modly
 
