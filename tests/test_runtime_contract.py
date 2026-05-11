@@ -473,8 +473,10 @@ class RuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(readiness["machine_code"], "setup_pending")
         self.assertEqual(readiness["label_hint"], "Setup pending")
-        self.assertEqual(readiness["blockers"][0]["component"], "weights")
-        self.assertEqual(readiness["blockers"][1]["component"], "host_support")
+        self.assertEqual(
+            [item["component"] for item in readiness["blockers"]],
+            ["weights", "runtime_adapter", "host_support"],
+        )
         self.assertIn("Missing required model weights", readiness["reason"])
 
     def test_generator_readiness_exposes_modly_contract_fields_when_ready(self) -> None:
@@ -1567,6 +1569,56 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIn("weights_ready=False", ctx.exception.message)
         self.assertIn("adapter_ready=False", ctx.exception.message)
         self.assertIn("Missing required model weights", ctx.exception.message)
+
+    def test_runtime_unavailable_prefers_runtime_adapter_import_smoke_details(self) -> None:
+        blocked_host = {
+            "ready": False,
+            "status": "blocked",
+            "failure": {"message": "Required runtime dependencies are missing."},
+        }
+        runtime_adapter = {
+            "ready": False,
+            "status": "blocked",
+            "message": "P3-SAM adapter is fail-closed.",
+            "components": {
+                "import_smoke": {
+                    "ready": False,
+                    "status": "blocked",
+                    "missing_modules": ["spconv", "torch_scatter"],
+                    "native_blockers": ["spconv.core_cc"],
+                    "error_type": "ModuleNotFoundError",
+                    "error": "No module named 'spconv'",
+                }
+            },
+        }
+        readiness = {
+            "setup": {"ready": True},
+            "weights": {"ready": True},
+            "runtime_adapter": runtime_adapter,
+            "host_support": blocked_host,
+            "details": {
+                "setup_ready": True,
+                "weights_ready": True,
+                "adapter_ready": False,
+                "host_support_ready": False,
+                "inference_supported": False,
+            },
+        }
+        generator = Hunyuan3DPartGenerator(
+            self.injected_model_dir,
+            self.workspace,
+            project_root=self.workspace,
+            runtime_context=self.ready_shell_context,
+        )
+
+        blockers = generator._collect_runtime_blockers(readiness)
+        message = generator._runtime_unavailable_message(blockers=blockers, readiness=readiness)
+
+        self.assertEqual([item["component"] for item in blockers], ["runtime_adapter", "host_support"])
+        self.assertIn("blockers=runtime_adapter,host_support", message)
+        self.assertIn("missing_modules=spconv,torch_scatter", message)
+        self.assertIn("native_blockers=spconv.core_cc", message)
+        self.assertIn("No module named 'spconv'", message)
 
     def test_generator_generate_does_not_block_on_stale_cuda_gate_when_torch_reports_cuda(self) -> None:
         stale_context = resolve_runtime_context(

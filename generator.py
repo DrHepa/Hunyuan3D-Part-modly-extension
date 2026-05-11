@@ -118,6 +118,10 @@ class Hunyuan3DPartGenerator(BaseGenerator):
         if not blockers:
             return None
         blocker = blockers[0]
+        if blocker.get("component") == "runtime_adapter":
+            adapter_reason = self._runtime_adapter_blocker_reason(blocker)
+            if adapter_reason:
+                return adapter_reason
         failure = blocker.get("failure")
         if isinstance(failure, Mapping) and failure.get("message"):
             return str(failure["message"])
@@ -128,6 +132,38 @@ class Hunyuan3DPartGenerator(BaseGenerator):
         if blocker.get("status"):
             return f"{blocker['component']} status={blocker['status']}"
         return f"{blocker['component']} is not ready"
+
+    def _runtime_adapter_blocker_reason(self, blocker: Mapping[str, object]) -> str | None:
+        components = blocker.get("components")
+        if not isinstance(components, Mapping):
+            return None
+        import_smoke = components.get("import_smoke")
+        if not isinstance(import_smoke, Mapping):
+            return str(blocker.get("message")) if blocker.get("message") else None
+
+        details: list[str] = []
+        missing_modules = import_smoke.get("missing_modules")
+        if isinstance(missing_modules, list) and missing_modules:
+            details.append("missing_modules=" + ",".join(str(item) for item in missing_modules))
+        native_blockers = import_smoke.get("native_blockers")
+        if isinstance(native_blockers, list) and native_blockers:
+            details.append("native_blockers=" + ",".join(str(item) for item in native_blockers))
+        error_type = import_smoke.get("error_type")
+        error = import_smoke.get("error")
+        if error_type or error:
+            details.append(f"error={error_type or 'Error'}: {error}".strip())
+        stderr = import_smoke.get("stderr")
+        if isinstance(stderr, str) and stderr.strip():
+            details.append("stderr=" + stderr.strip().replace("\n", " | ")[:500])
+        if details:
+            return "Runtime adapter import smoke failed: " + "; ".join(details)
+        message = blocker.get("message")
+        if message:
+            return str(message)
+        status = import_smoke.get("status")
+        if status:
+            return f"Runtime adapter import smoke status={status}"
+        return None
 
     def _runtime_unavailable_message(
         self,
@@ -260,7 +296,11 @@ class Hunyuan3DPartGenerator(BaseGenerator):
         for key in ("runtime_adapter",):
             section = readiness[key]
             if isinstance(section, Mapping) and not bool(section.get("ready", False)):
-                blockers.append({"component": key, **dict(section)})
+                blocker = {"component": key, **dict(section)}
+                if blockers and blockers[-1].get("component") == "host_support":
+                    blockers.insert(len(blockers) - 1, blocker)
+                else:
+                    blockers.append(blocker)
         return blockers
 
     def _emit_progress(
