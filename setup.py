@@ -36,7 +36,6 @@ SETUP_SUMMARY_NAME = ".modly-setup-summary.json"
 NATIVE_BUILD_ARTIFACTS_DIRNAME = ".modly/native-build-artifacts"
 TORCH_SCATTER_VERSION = "2.1.2"
 TORCH_CLUSTER_VERSION = "1.6.3"
-WINDOWS_PYG_CU124_INDEX_URL = "https://data.pyg.org/whl/torch-2.5.0+cu124.html"
 WINDOWS_SPCONV_CU120_PACKAGE = "spconv-cu120==2.3.6"
 RUNTIME_PACKAGES = [
     "numpy",
@@ -1452,35 +1451,65 @@ def _linux_arm64_native_install_steps(*, gpu_sm: int, toolkit: dict[str, Any], v
     )
 
 
-def _windows_amd64_native_install_steps() -> tuple[NativeInstallStep, ...]:
+def _windows_pyg_wheel_plan(torch_plan: dict[str, Any]) -> dict[str, str]:
+    torch_version: str | None = None
+    for requirement in torch_plan.get("pins") or torch_plan.get("packages") or ():
+        match = re.match(r"^torch==(?P<version>\d+\.\d+\.\d+)(?:\+[^\s]+)?$", str(requirement))
+        if match:
+            torch_version = match.group("version")
+            break
+    if not torch_version:
+        raise RuntimeError(f"Unable to derive Windows PyG wheel plan from torch packages: {torch_plan.get('packages')!r}.")
+
+    cuda_label = str(torch_plan.get("label") or "").strip().lower()
+    if not re.fullmatch(r"cu\d+", cuda_label):
+        raise RuntimeError(f"Unable to derive Windows PyG CUDA suffix from torch plan label: {cuda_label!r}.")
+
+    major, minor, _patch = torch_version.split(".", 2)
+    return {
+        "index_url": f"https://data.pyg.org/whl/torch-{torch_version}+{cuda_label}.html",
+        "suffix": f"pt{major}{minor}{cuda_label}",
+        "torch_version": torch_version,
+        "cuda_label": cuda_label,
+    }
+
+
+def _windows_amd64_native_install_steps(torch_plan: dict[str, Any]) -> tuple[NativeInstallStep, ...]:
+    pyg_plan = _windows_pyg_wheel_plan(torch_plan)
+    pyg_suffix = pyg_plan["suffix"]
+    pyg_index_url = pyg_plan["index_url"]
+    reason = (
+        "Windows AMD64 uses PyG prebuilt wheels matching the managed PyTorch/CUDA install plan "
+        f"({pyg_plan['torch_version']}+{pyg_plan['cuda_label']}) instead of source builds."
+    )
     return (
         NativeInstallStep(
             package="torch_scatter",
-            requirement=f"torch-scatter=={TORCH_SCATTER_VERSION}+pt25cu124",
+            requirement=f"torch-scatter=={TORCH_SCATTER_VERSION}+{pyg_suffix}",
             strategy="pip-prebuilt-wheel",
             status="planned",
             pip_args=(
                 "install",
-                f"torch-scatter=={TORCH_SCATTER_VERSION}+pt25cu124",
+                f"torch-scatter=={TORCH_SCATTER_VERSION}+{pyg_suffix}",
                 "-f",
-                WINDOWS_PYG_CU124_INDEX_URL,
+                pyg_index_url,
                 "--no-cache-dir",
             ),
-            reason="Windows AMD64 uses PyG prebuilt wheels for PyTorch 2.5 / CUDA 12.4 instead of source builds.",
+            reason=reason,
         ),
         NativeInstallStep(
             package="torch_cluster",
-            requirement=f"torch-cluster=={TORCH_CLUSTER_VERSION}+pt25cu124",
+            requirement=f"torch-cluster=={TORCH_CLUSTER_VERSION}+{pyg_suffix}",
             strategy="pip-prebuilt-wheel",
             status="planned",
             pip_args=(
                 "install",
-                f"torch-cluster=={TORCH_CLUSTER_VERSION}+pt25cu124",
+                f"torch-cluster=={TORCH_CLUSTER_VERSION}+{pyg_suffix}",
                 "-f",
-                WINDOWS_PYG_CU124_INDEX_URL,
+                pyg_index_url,
                 "--no-cache-dir",
             ),
-            reason="Windows AMD64 uses PyG prebuilt wheels for PyTorch 2.5 / CUDA 12.4 instead of source builds.",
+            reason=reason,
         ),
         NativeInstallStep(
             package="spconv",
@@ -1564,11 +1593,18 @@ def build_native_runtime_plan(
             f"validated base-runtime lanes. Received gpu_sm={gpu_sm} cuda_version={cuda_version}."
         )
     elif _is_windows_amd64(system_name, normalized_machine):
-        lane = "windows-amd64-cu124-prebuilt"
-        desired_cuda_label = "cu124"
+        torch_plan = torch_install_plan(
+            system_name=system_name,
+            machine=normalized_machine,
+            py_tag=py_tag,
+            gpu_sm=gpu_sm,
+            cuda_version=cuda_version,
+        )
+        desired_cuda_label = str(torch_plan.get("label") or "")
+        lane = f"windows-amd64-{desired_cuda_label}-prebuilt"
         state = SUPPORTED
         reason = (
-            "Windows AMD64 uses prebuilt PyG CUDA 12.4 wheels plus spconv-cu120; "
+            "Windows AMD64 uses prebuilt PyG wheels matching the selected PyTorch/CUDA lane plus spconv-cu120; "
             "runtime inference still depends on the managed import smoke passing on the target host."
         )
 
@@ -1585,9 +1621,16 @@ def build_native_runtime_plan(
     )
     toolkit = resolve_cuda_toolkit_for_label(desired_cuda_label)
     resolved_venv_dir = venv_dir or (ROOT / "venv")
-    if state == SUPPORTED and lane == "windows-amd64-cu124-prebuilt":
+    if state == SUPPORTED and _is_windows_amd64(system_name, normalized_machine):
         install_strategy = "windows-amd64-prebuilt-wheels"
-        install_steps = _windows_amd64_native_install_steps()
+        torch_plan = torch_install_plan(
+            system_name=system_name,
+            machine=normalized_machine,
+            py_tag=py_tag,
+            gpu_sm=gpu_sm,
+            cuda_version=cuda_version,
+        )
+        install_steps = _windows_amd64_native_install_steps(torch_plan)
         message = (
             "Windows AMD64 native runtime uses prebuilt wheels and may be installed automatically during managed setup."
         )

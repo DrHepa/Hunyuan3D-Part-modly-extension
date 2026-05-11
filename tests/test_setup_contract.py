@@ -795,7 +795,7 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
         self.assertNotIn("CUMM_DISABLE_JIT", plan.install_steps[4].env)
         self.assertEqual(plan.install_steps[4].reason, plan.install_steps[3].reason)
 
-    def test_build_native_runtime_plan_marks_windows_amd64_prebuilt_lane_supported(self) -> None:
+    def test_build_native_runtime_plan_marks_windows_amd64_cu124_prebuilt_lane_supported(self) -> None:
         plan = self.setup.build_native_runtime_plan(
             system_name="Windows",
             machine="AMD64",
@@ -816,17 +816,56 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
             "install",
             "torch-scatter==2.1.2+pt25cu124",
             "-f",
-            "https://data.pyg.org/whl/torch-2.5.0+cu124.html",
+            "https://data.pyg.org/whl/torch-2.5.1+cu124.html",
             "--no-cache-dir",
         ))
         self.assertEqual(plan.install_steps[1].pip_args, (
             "install",
             "torch-cluster==1.6.3+pt25cu124",
             "-f",
-            "https://data.pyg.org/whl/torch-2.5.0+cu124.html",
+            "https://data.pyg.org/whl/torch-2.5.1+cu124.html",
             "--no-cache-dir",
         ))
         self.assertEqual(plan.install_steps[2].pip_args, ("install", "spconv-cu120==2.3.6", "--no-cache-dir"))
+
+    def test_build_native_runtime_plan_uses_windows_pyg_wheels_matching_cu128_torch_plan(self) -> None:
+        plan = self.setup.build_native_runtime_plan(
+            system_name="Windows",
+            machine="AMD64",
+            py_tag="cp311",
+            gpu_sm=100,
+            cuda_version=128,
+            native_mode="auto",
+            venv_dir=Path("C:/Users/franc/Tools/Modly/extensions/hunyuan3d-part/venv"),
+        )
+
+        self.assertEqual(plan.host.lane, "windows-amd64-cu128-prebuilt")
+        self.assertEqual(plan.host.state, "supported")
+        self.assertEqual(plan.desired_cuda_label, "cu128")
+        self.assertEqual(plan.install_strategy, "windows-amd64-prebuilt-wheels")
+        self.assertTrue(plan.automatic_install_supported)
+        self.assertEqual([step.package for step in plan.install_steps], ["torch_scatter", "torch_cluster", "spconv"])
+        self.assertEqual(plan.install_steps[0].pip_args, (
+            "install",
+            "torch-scatter==2.1.2+pt27cu128",
+            "-f",
+            "https://data.pyg.org/whl/torch-2.7.0+cu128.html",
+            "--no-cache-dir",
+        ))
+        self.assertEqual(plan.install_steps[1].pip_args, (
+            "install",
+            "torch-cluster==1.6.3+pt27cu128",
+            "-f",
+            "https://data.pyg.org/whl/torch-2.7.0+cu128.html",
+            "--no-cache-dir",
+        ))
+        self.assertEqual(plan.install_steps[2].pip_args, ("install", "spconv-cu120==2.3.6", "--no-cache-dir"))
+
+    def test_windows_pyg_wheel_plan_supports_torch_27_cu126_suffix(self) -> None:
+        plan = self.setup._windows_pyg_wheel_plan({"packages": ["torch==2.7.0", "torchvision==0.22.0"], "label": "cu126"})
+
+        self.assertEqual(plan["suffix"], "pt27cu126")
+        self.assertEqual(plan["index_url"], "https://data.pyg.org/whl/torch-2.7.0+cu126.html")
 
     def test_build_native_runtime_plan_uses_linux_arm64_source_build_for_cu124_lane(self) -> None:
         venv_dir = Path("/tmp/native-plan-cu124")
