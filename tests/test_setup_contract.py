@@ -58,6 +58,24 @@ class SetupContractTests(unittest.TestCase):
         )
         return header_path
 
+    def _auto_mask_source(self, *, patched: bool = False) -> str:
+        resource_lines = (
+            self.setup.P3_SAM_AUTO_MASK_RESOURCE_PATCH_NEW
+            if patched
+            else self.setup.P3_SAM_AUTO_MASK_RESOURCE_PATCH_OLD
+        )
+        return (
+            "def mesh_sam(mesh_path, output_path, ckpt_path, point_num=100000, prompt_num=400, prompt_bs=32):\n"
+            f"{resource_lines}"
+            "    return point_num, prompt_num, prompt_bs\n"
+        )
+
+    def _write_fake_auto_mask(self, runtime_root: Path, *, source: str | None = None, patched: bool = False) -> Path:
+        auto_mask_path = runtime_root / "P3-SAM" / "demo" / "auto_mask.py"
+        auto_mask_path.parent.mkdir(parents=True, exist_ok=True)
+        auto_mask_path.write_text(source if source is not None else self._auto_mask_source(patched=patched), encoding="utf-8")
+        return auto_mask_path
+
     def _write_fake_cumm_tf32_header(self, include_root: Path, source: str | None = None) -> Path:
         header_path = include_root / "tensorview" / "gemm" / "dtypes" / "tf32.h"
         header_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3975,8 +3993,11 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
                 "def load_by_config(config_path: str):\n    with open(config_path, \"r\") as f:\n        config = json.load(f)\n    model = PointTransformerV3(**config)\n    return model\n",
                 encoding="utf-8",
             )
+            self._write_fake_auto_mask(runtime_root)
             for relative_path in self.setup.UPSTREAM_REQUIRED_PATHS[1:]:
                 target = runtime_root / relative_path
+                if target == runtime_root / self.setup.UPSTREAM_P3_SAM_AUTO_MASK_RELATIVE_PATH:
+                    continue
                 if target.suffix:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text("ok\n", encoding="utf-8")
@@ -4006,11 +4027,13 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
                 "def load_by_config(config_path: str):\n    with open(config_path, \"r\") as f:\n        config = json.load(f)\n    model = PointTransformerV3(**config)\n    return model\n",
                 encoding="utf-8",
             )
+            auto_mask_path = self._write_fake_auto_mask(self.setup.runtime_source_root(extension_dir))
 
             first = self.setup.patch_prepared_upstream_source(extension_dir)
             second = self.setup.patch_prepared_upstream_source(extension_dir)
             content = model_path.read_text(encoding="utf-8")
             sonata_content = sonata_model_path.read_text(encoding="utf-8")
+            auto_mask_content = auto_mask_path.read_text(encoding="utf-8")
 
         self.assertEqual(first["status"], "patched")
         self.assertEqual(second["status"], "already_patched")
@@ -4018,11 +4041,70 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
         self.assertNotIn("/root/sonata", content)
         self.assertIn(self.setup.SONATA_FLASH_ATTENTION_LOAD_PATCH_NEW, sonata_content)
         self.assertIn(self.setup.SONATA_FLASH_ATTENTION_LOAD_BY_CONFIG_PATCH_NEW, sonata_content)
+        self.assertIn(self.setup.P3_SAM_AUTO_MASK_RESOURCE_PATCH_NEW, auto_mask_content)
+        self.assertNotIn(self.setup.P3_SAM_AUTO_MASK_RESOURCE_PATCH_OLD, auto_mask_content)
         self.assertEqual(first["components"]["p3_sam_sonata_cache_patch"]["status"], "patched")
         self.assertEqual(first["components"]["sonata_flash_attention_patch"]["status"], "patched")
+        self.assertEqual(first["components"]["p3_sam_auto_mask_resource_patch"]["status"], "patched")
         self.assertEqual(first["components"]["sonata_flash_attention_patch"]["sites"]["load"]["status"], "patched")
         self.assertEqual(first["components"]["sonata_flash_attention_patch"]["sites"]["load_by_config"]["status"], "patched")
         self.assertEqual(second["components"]["sonata_flash_attention_patch"]["status"], "already_patched")
+
+    def test_patch_prepared_upstream_source_patches_auto_mask_resource_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            extension_dir = Path(temp_dir)
+            runtime_root = self.setup.runtime_source_root(extension_dir)
+            p3_model_path = runtime_root / "P3-SAM" / "model.py"
+            sonata_model_path = runtime_root / "XPart" / "partgen" / "models" / "sonata" / "model.py"
+            p3_model_path.parent.mkdir(parents=True, exist_ok=True)
+            p3_model_path.write_text(
+                f"import os\nself.sonata = sonata.load('sonata', repo_id='facebook/sonata', {self.setup.UPSTREAM_MODEL_PATCH_NEW})\n",
+                encoding="utf-8",
+            )
+            sonata_model_path.parent.mkdir(parents=True, exist_ok=True)
+            sonata_model_path.write_text(
+                "def build(ckpt):\n    ckpt[\"config\"][\"enable_flash\"] = False\n    model = PointTransformerV3(**ckpt[\"config\"])\n    return model\n\n"
+                "def load_by_config(config_path: str):\n    with open(config_path, \"r\") as f:\n        config = json.load(f)\n    config[\"enable_flash\"] = False\n    model = PointTransformerV3(**config)\n    return model\n",
+                encoding="utf-8",
+            )
+            auto_mask_path = self._write_fake_auto_mask(runtime_root)
+
+            patch = self.setup.patch_prepared_upstream_source(extension_dir)
+            content = auto_mask_path.read_text(encoding="utf-8")
+
+        self.assertTrue(patch["ready"])
+        self.assertEqual(patch["components"]["p3_sam_auto_mask_resource_patch"]["status"], "patched")
+        self.assertIn(self.setup.P3_SAM_AUTO_MASK_RESOURCE_PATCH_NEW, content)
+        self.assertNotIn(self.setup.P3_SAM_AUTO_MASK_RESOURCE_PATCH_OLD, content)
+        self.assertIn("return point_num, prompt_num, prompt_bs", content)
+
+    def test_patch_prepared_upstream_source_fails_closed_for_unknown_auto_mask_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            extension_dir = Path(temp_dir)
+            runtime_root = self.setup.runtime_source_root(extension_dir)
+            p3_model_path = runtime_root / "P3-SAM" / "model.py"
+            sonata_model_path = runtime_root / "XPart" / "partgen" / "models" / "sonata" / "model.py"
+            p3_model_path.parent.mkdir(parents=True, exist_ok=True)
+            p3_model_path.write_text(
+                f"import os\nself.sonata = sonata.load('sonata', repo_id='facebook/sonata', {self.setup.UPSTREAM_MODEL_PATCH_NEW})\n",
+                encoding="utf-8",
+            )
+            sonata_model_path.parent.mkdir(parents=True, exist_ok=True)
+            sonata_model_path.write_text(
+                "def build(ckpt):\n    ckpt[\"config\"][\"enable_flash\"] = False\n    model = PointTransformerV3(**ckpt[\"config\"])\n    return model\n\n"
+                "def load_by_config(config_path: str):\n    with open(config_path, \"r\") as f:\n        config = json.load(f)\n    config[\"enable_flash\"] = False\n    model = PointTransformerV3(**config)\n    return model\n",
+                encoding="utf-8",
+            )
+            self._write_fake_auto_mask(runtime_root, source="def mesh_sam(point_num=100000):\n    return point_num\n")
+
+            patch = self.setup.patch_prepared_upstream_source(extension_dir)
+
+        self.assertFalse(patch["ready"])
+        self.assertEqual(patch["status"], "invalid")
+        self.assertEqual(
+            patch["components"]["p3_sam_auto_mask_resource_patch"]["reason"],
+            "unexpected_p3_sam_auto_mask_resource_patch_shape",
+        )
 
     def test_patch_prepared_upstream_source_inserts_sonata_flash_fallback_before_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4041,6 +4123,7 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
                 "def load_by_config(config_path: str):\n    with open(config_path, \"r\") as f:\n        config = json.load(f)\n    model = PointTransformerV3(**config)\n    return model\n",
                 encoding="utf-8",
             )
+            self._write_fake_auto_mask(runtime_root)
 
             patch = self.setup.patch_prepared_upstream_source(extension_dir)
             content = sonata_model_path.read_text(encoding="utf-8")
@@ -4077,11 +4160,13 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
                 "def load_by_config(config_path: str):\n    with open(config_path, \"r\") as f:\n        config = json.load(f)\n    config[\"enable_flash\"] = False\n    model = PointTransformerV3(**config)\n    return model\n",
                 encoding="utf-8",
             )
+            self._write_fake_auto_mask(runtime_root, patched=True)
 
             patch = self.setup.patch_prepared_upstream_source(extension_dir)
 
         self.assertEqual(patch["status"], "already_patched")
         self.assertEqual(patch["components"]["sonata_flash_attention_patch"]["status"], "already_patched")
+        self.assertEqual(patch["components"]["p3_sam_auto_mask_resource_patch"]["status"], "already_patched")
         self.assertEqual(patch["components"]["sonata_flash_attention_patch"]["sites"]["load"]["status"], "already_patched")
         self.assertEqual(patch["components"]["sonata_flash_attention_patch"]["sites"]["load_by_config"]["status"], "already_patched")
 
@@ -4102,6 +4187,7 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
                 "def load_by_config(config_path: str):\n    with open(config_path, \"r\") as f:\n        config = json.load(f)\n    model = PointTransformerV3(**config)\n    return model\n",
                 encoding="utf-8",
             )
+            self._write_fake_auto_mask(runtime_root)
 
             patch = self.setup.patch_prepared_upstream_source(extension_dir)
 
@@ -4130,6 +4216,7 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
                 "def load_by_config(config_path: str):\n    with open(config_path, \"r\") as f:\n        config = json.load(f)\n    config.setdefault(\"enable_flash\", True)\n    model = PointTransformerV3(**config)\n    return model\n",
                 encoding="utf-8",
             )
+            self._write_fake_auto_mask(runtime_root)
 
             patch = self.setup.patch_prepared_upstream_source(extension_dir)
 
@@ -4163,8 +4250,11 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
                         "def load_by_config(config_path: str):\n    with open(config_path, \"r\") as f:\n        config = json.load(f)\n    model = PointTransformerV3(**config)\n    return model\n",
                         encoding="utf-8",
                     )
+                    self._write_fake_auto_mask(runtime_root)
                     for relative_path in self.setup.UPSTREAM_REQUIRED_PATHS[1:]:
                         target = runtime_root / relative_path
+                        if target == runtime_root / self.setup.UPSTREAM_P3_SAM_AUTO_MASK_RELATIVE_PATH:
+                            continue
                         if target.suffix:
                             target.parent.mkdir(parents=True, exist_ok=True)
                             target.write_text("ok\n", encoding="utf-8")

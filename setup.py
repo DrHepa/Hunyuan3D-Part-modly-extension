@@ -644,6 +644,7 @@ ARM64_CU128_WHEELS = {
 UPSTREAM_REPO_URL = "https://github.com/Tencent-Hunyuan/Hunyuan3D-Part.git"
 UPSTREAM_REPO_REF = "main"
 UPSTREAM_P3_SAM_MODEL_RELATIVE_PATH = Path("P3-SAM") / "model.py"
+UPSTREAM_P3_SAM_AUTO_MASK_RELATIVE_PATH = Path("P3-SAM") / "demo" / "auto_mask.py"
 UPSTREAM_SONATA_MODEL_RELATIVE_PATH = Path("XPart") / "partgen" / "models" / "sonata" / "model.py"
 UPSTREAM_MODEL_PATCH_OLD = "download_root='/root/sonata'"
 UPSTREAM_MODEL_PATCH_NEW = (
@@ -657,6 +658,8 @@ SONATA_FLASH_ATTENTION_LOAD_MODEL_LINE = 'model = PointTransformerV3(**ckpt["con
 SONATA_FLASH_ATTENTION_LOAD_BY_CONFIG_PATCH_NEW = 'config["enable_flash"] = False'
 SONATA_FLASH_ATTENTION_LOAD_BY_CONFIG_MODEL_LINE = 'model = PointTransformerV3(**config)'
 SONATA_FLASH_ATTENTION_LOAD_BY_CONFIG_PREVIOUS_LINE = 'config = json.load(f)'
+P3_SAM_AUTO_MASK_RESOURCE_PATCH_OLD = "    point_num = 100000\n    prompt_num = 400\n"
+P3_SAM_AUTO_MASK_RESOURCE_PATCH_NEW = "    # Respect CLI --point_num / --prompt_num; upstream defaults remain in mesh_sam's signature.\n"
 
 NATIVE_MODE_AUTO = "auto"
 NATIVE_MODE_SKIP = "skip"
@@ -4200,9 +4203,13 @@ def patch_prepared_upstream_source(extension_dir: Path) -> dict[str, Any]:
     sonata_flash_attention_patch = _patch_prepared_sonata_model_source(
         runtime_root / UPSTREAM_SONATA_MODEL_RELATIVE_PATH,
     )
+    auto_mask_resource_patch = _patch_prepared_p3_sam_auto_mask_source(
+        runtime_root / UPSTREAM_P3_SAM_AUTO_MASK_RELATIVE_PATH,
+    )
     components = {
         "p3_sam_sonata_cache_patch": p3_sam_patch,
         "sonata_flash_attention_patch": sonata_flash_attention_patch,
+        "p3_sam_auto_mask_resource_patch": auto_mask_resource_patch,
     }
     statuses = [component["status"] for component in components.values()]
     if any(status == "invalid" for status in statuses):
@@ -4221,9 +4228,51 @@ def patch_prepared_upstream_source(extension_dir: Path) -> dict[str, Any]:
         "env_var": SONATA_CACHE_ENV_VAR,
         "paths": {
             "p3_sam_model": str(runtime_root / UPSTREAM_P3_SAM_MODEL_RELATIVE_PATH),
+            "p3_sam_auto_mask": str(runtime_root / UPSTREAM_P3_SAM_AUTO_MASK_RELATIVE_PATH),
             "sonata_model": str(runtime_root / UPSTREAM_SONATA_MODEL_RELATIVE_PATH),
         },
         "components": components,
+    }
+
+
+def _patch_prepared_p3_sam_auto_mask_source(auto_mask_path: Path) -> dict[str, Any]:
+    if not auto_mask_path.is_file():
+        return {
+            "ready": False,
+            "status": "missing",
+            "path": str(auto_mask_path),
+            "reason": "missing_auto_mask_py",
+        }
+
+    source = auto_mask_path.read_text(encoding="utf-8")
+    if P3_SAM_AUTO_MASK_RESOURCE_PATCH_NEW in source:
+        status = "already_patched"
+        patched_source = source
+    elif P3_SAM_AUTO_MASK_RESOURCE_PATCH_OLD in source:
+        status = "patched"
+        patched_source = source.replace(P3_SAM_AUTO_MASK_RESOURCE_PATCH_OLD, P3_SAM_AUTO_MASK_RESOURCE_PATCH_NEW, 1)
+    else:
+        return {
+            "ready": False,
+            "status": "invalid",
+            "path": str(auto_mask_path),
+            "reason": "unexpected_p3_sam_auto_mask_resource_patch_shape",
+            "expected_fragment": P3_SAM_AUTO_MASK_RESOURCE_PATCH_OLD,
+        }
+
+    if patched_source != source:
+        auto_mask_path.write_text(patched_source, encoding="utf-8")
+
+    verified_source = auto_mask_path.read_text(encoding="utf-8")
+    verified = (
+        P3_SAM_AUTO_MASK_RESOURCE_PATCH_NEW in verified_source
+        and P3_SAM_AUTO_MASK_RESOURCE_PATCH_OLD not in verified_source
+    )
+    return {
+        "ready": verified,
+        "status": status if verified else "invalid",
+        "path": str(auto_mask_path),
+        "line": P3_SAM_AUTO_MASK_RESOURCE_PATCH_NEW.strip(),
     }
 
 

@@ -26,6 +26,12 @@ UPSTREAM_REQUIRED_PATHS = (
 )
 DEFAULT_PROMPT_BATCH_SIZE = 32
 WINDOWS_DEFAULT_PROMPT_BATCH_SIZE = 1
+DEFAULT_POINT_NUM = 100000
+DEFAULT_PROMPT_NUM = 400
+WINDOWS_DEFAULT_POINT_NUM = 32768
+WINDOWS_DEFAULT_PROMPT_NUM = 128
+POINT_NUM_ENV_VAR = "HUNYUAN3D_PART_P3SAM_POINT_NUM"
+PROMPT_NUM_ENV_VAR = "HUNYUAN3D_PART_P3SAM_PROMPT_NUM"
 PROMPT_BATCH_SIZE_ENV_VAR = "HUNYUAN3D_PART_P3SAM_PROMPT_BS"
 PYTORCH_CUDA_ALLOC_CONF_ENV_VAR = "PYTORCH_CUDA_ALLOC_CONF"
 DEFAULT_PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
@@ -109,6 +115,20 @@ class AdapterReadiness:
 
 RuntimeAdapter = Callable[[ExecutionPlan], DecompositionArtifacts]
 SubprocessRunner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+@dataclass(frozen=True)
+class P3SAMRuntimeKnobs:
+    point_num: int
+    prompt_num: int
+    prompt_bs: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "point_num": self.point_num,
+            "prompt_num": self.prompt_num,
+            "prompt_bs": self.prompt_bs,
+        }
 
 
 def build_execution_plan(
@@ -349,32 +369,58 @@ def _require_adapter_paths(readiness: AdapterReadiness) -> AdapterPaths:
     )
 
 
-def resolve_prompt_batch_size(os_name: str | None, env: Mapping[str, str] | None = None) -> int:
-    """Resolve upstream P3-SAM prompt batch size with a safer Windows default.
+def _resolve_positive_int_env(
+    env_var: str,
+    *,
+    configured: str | None,
+    code: str,
+) -> int | None:
+    if configured is None:
+        return None
+    try:
+        value = int(configured.strip())
+    except ValueError:
+        value = 0
+    if value <= 0:
+        raise SetupFailure(
+            f"{env_var} must be a positive integer when set.",
+            code=code,
+            details={"env_var": env_var, "observed": configured},
+        )
+    return value
 
-    Upstream ``auto_mask.py`` uses 100k points during mask inference. On Windows,
-    the previous prompt batch of 32 triggered a >6 GiB allocation on an 8 GiB GPU,
-    so keep Linux compatible while lowering Windows to a conservative default.
+
+def resolve_p3_sam_runtime_knobs(os_name: str | None, env: Mapping[str, str] | None = None) -> P3SAMRuntimeKnobs:
+    """Resolve upstream P3-SAM point/prompt counts with safer Windows defaults.
+
+    Linux stays compatible with upstream defaults (100k points, 400 prompts, batch
+    32). Windows defaults trade some segmentation granularity for 8 GB VRAM safety:
+    fewer sampled points and prompts reduce the tensor sizes that feed the P3-SAM
+    segmentation MLP, while prompt batch size remains the existing conservative 1.
     """
 
     current_env = env or os.environ
-    configured = current_env.get(PROMPT_BATCH_SIZE_ENV_VAR)
-    if configured is not None:
-        try:
-            value = int(configured.strip())
-        except ValueError:
-            value = 0
-        if value <= 0:
-            raise SetupFailure(
-                f"{PROMPT_BATCH_SIZE_ENV_VAR} must be a positive integer when set.",
-                code="invalid_p3_sam_prompt_batch_size",
-                details={"env_var": PROMPT_BATCH_SIZE_ENV_VAR, "observed": configured},
-            )
-        return value
+    is_windows = (os_name or "").strip().lower() == "windows"
+    point_num = _resolve_positive_int_env(
+        POINT_NUM_ENV_VAR,
+        configured=current_env.get(POINT_NUM_ENV_VAR),
+        code="invalid_p3_sam_point_num",
+    ) or (WINDOWS_DEFAULT_POINT_NUM if is_windows else DEFAULT_POINT_NUM)
+    prompt_num = _resolve_positive_int_env(
+        PROMPT_NUM_ENV_VAR,
+        configured=current_env.get(PROMPT_NUM_ENV_VAR),
+        code="invalid_p3_sam_prompt_num",
+    ) or (WINDOWS_DEFAULT_PROMPT_NUM if is_windows else DEFAULT_PROMPT_NUM)
+    prompt_bs = _resolve_positive_int_env(
+        PROMPT_BATCH_SIZE_ENV_VAR,
+        configured=current_env.get(PROMPT_BATCH_SIZE_ENV_VAR),
+        code="invalid_p3_sam_prompt_batch_size",
+    ) or (WINDOWS_DEFAULT_PROMPT_BATCH_SIZE if is_windows else DEFAULT_PROMPT_BATCH_SIZE)
+    return P3SAMRuntimeKnobs(point_num=point_num, prompt_num=prompt_num, prompt_bs=prompt_bs)
 
-    if (os_name or "").strip().lower() == "windows":
-        return WINDOWS_DEFAULT_PROMPT_BATCH_SIZE
-    return DEFAULT_PROMPT_BATCH_SIZE
+
+def resolve_prompt_batch_size(os_name: str | None, env: Mapping[str, str] | None = None) -> int:
+    return resolve_p3_sam_runtime_knobs(os_name, env=env).prompt_bs
 
 
 def build_subprocess_command(
@@ -388,7 +434,7 @@ def build_subprocess_command(
     host_os_name: str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> list[str]:
-    prompt_batch_size = resolve_prompt_batch_size(host_os_name, env=env)
+    runtime_knobs = resolve_p3_sam_runtime_knobs(host_os_name, env=env)
     command = subprocess_command(
         managed_python,
         entrypoint,
@@ -400,8 +446,12 @@ def build_subprocess_command(
         output_dir,
         "--seed",
         str(params.seed if params.seed is not None else 42),
+        "--point_num",
+        str(runtime_knobs.point_num),
+        "--prompt_num",
+        str(runtime_knobs.prompt_num),
         "--prompt_bs",
-        str(prompt_batch_size),
+        str(runtime_knobs.prompt_bs),
         "--show_info",
         "0",
         "--show_time_info",
@@ -434,7 +484,14 @@ def _existing_artifacts(output_dir: Path) -> list[str]:
     return sorted(str(path) for path in output_dir.iterdir() if path.is_file())
 
 
-def _format_failure_message(*, returncode: int, diagnostics: Mapping[str, str], stdout_tail: str, stderr_tail: str) -> str:
+def _format_failure_message(
+    *,
+    returncode: int,
+    diagnostics: Mapping[str, str],
+    stdout_tail: str,
+    stderr_tail: str,
+    runtime_knobs: Mapping[str, int] | None = None,
+) -> str:
     lines = [
         f"Upstream P3-SAM subprocess failed with return code {returncode}.",
         "Persisted diagnostics:",
@@ -442,6 +499,13 @@ def _format_failure_message(*, returncode: int, diagnostics: Mapping[str, str], 
         f"- stderr_log: {diagnostics.get('stderr')}",
         f"- stdout_log: {diagnostics.get('stdout')}",
     ]
+    if runtime_knobs:
+        lines.append(
+            "Runtime knobs: "
+            f"point_num={runtime_knobs.get('point_num')}, "
+            f"prompt_num={runtime_knobs.get('prompt_num')}, "
+            f"prompt_bs={runtime_knobs.get('prompt_bs')}"
+        )
     if stderr_tail:
         lines.extend(["", "stderr tail:", stderr_tail.rstrip()])
     if stdout_tail:
@@ -568,6 +632,7 @@ def _persist_failure_diagnostics(
     command: list[str],
     cwd: str,
     result: subprocess.CompletedProcess[str],
+    runtime_knobs: Mapping[str, int] | None = None,
 ) -> dict[str, str]:
     stdout_path = output_dir / P3_SAM_STDOUT_LOG_NAME
     stderr_path = output_dir / P3_SAM_STDERR_LOG_NAME
@@ -580,6 +645,7 @@ def _persist_failure_diagnostics(
         json.dumps(
             {
                 "command": command,
+                "runtime_knobs": dict(runtime_knobs or {}),
                 "cwd": cwd,
                 "returncode": result.returncode,
                 "stdout_log": str(stdout_path),
@@ -675,6 +741,8 @@ def run_upstream_p3_sam(
     )
     paths = _require_adapter_paths(readiness)
     output_dir.mkdir(parents=True, exist_ok=True)
+    base_env = os.environ
+    runtime_knobs = resolve_p3_sam_runtime_knobs(plan.context.host_facts.os_name, env=base_env).to_dict()
     command = build_subprocess_command(
         managed_python=paths.managed_python,
         entrypoint=paths.entrypoint,
@@ -683,8 +751,8 @@ def run_upstream_p3_sam(
         output_dir=output_dir,
         params=plan.params,
         host_os_name=plan.context.host_facts.os_name,
+        env=base_env,
     )
-    base_env = os.environ
     env = build_runtime_env(
         base_env,
         pythonpath=(runtime_source_root(project_root),),
@@ -704,6 +772,7 @@ def run_upstream_p3_sam(
             command=command,
             cwd=str(paths.entrypoint.parent),
             result=result,
+            runtime_knobs=runtime_knobs,
         )
         stdout_tail = _tail_text(result.stdout)
         stderr_tail = _tail_text(result.stderr)
@@ -713,6 +782,7 @@ def run_upstream_p3_sam(
                 diagnostics=diagnostics,
                 stdout_tail=stdout_tail,
                 stderr_tail=stderr_tail,
+                runtime_knobs=runtime_knobs,
             ),
             code="p3_sam_subprocess_failed",
             details={
@@ -722,6 +792,7 @@ def run_upstream_p3_sam(
                 "stdout": stdout_tail,
                 "stderr": stderr_tail,
                 "diagnostics": diagnostics,
+                "runtime_knobs": runtime_knobs,
             },
         )
     return collect_artifacts(output_dir, export_format=plan.params.export_format, params=plan.params)

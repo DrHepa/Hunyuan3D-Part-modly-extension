@@ -46,12 +46,18 @@ from runtime.platform_support import (
 )
 from runtime.p3_sam import (
     AdapterReadiness,
+    DEFAULT_POINT_NUM,
     DEFAULT_PROMPT_BATCH_SIZE,
+    DEFAULT_PROMPT_NUM,
     DEFAULT_PYTORCH_CUDA_ALLOC_CONF,
+    POINT_NUM_ENV_VAR,
     PROMPT_BATCH_SIZE_ENV_VAR,
+    PROMPT_NUM_ENV_VAR,
     PYTORCH_CUDA_ALLOC_CONF_ENV_VAR,
     SONATA_CACHE_ENV_VAR,
+    WINDOWS_DEFAULT_POINT_NUM,
     WINDOWS_DEFAULT_PROMPT_BATCH_SIZE,
+    WINDOWS_DEFAULT_PROMPT_NUM,
     AdapterPaths,
     P3_SAM_FAILURE_JSON_NAME,
     P3_SAM_STDERR_LOG_NAME,
@@ -61,6 +67,7 @@ from runtime.p3_sam import (
     build_subprocess_command,
     collect_artifacts as collect_p3_sam_artifacts,
     decompose_mesh,
+    resolve_p3_sam_runtime_knobs,
     resolve_prompt_batch_size,
     resolve_weight_path,
     run_upstream_p3_sam,
@@ -761,9 +768,11 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIn("--save_mid_res", command)
         self.assertIn("--post_process", command)
         self.assertEqual(command[command.index("--save_mid_res") + 1], "1")
+        self.assertEqual(command[command.index("--point_num") + 1], str(DEFAULT_POINT_NUM))
+        self.assertEqual(command[command.index("--prompt_num") + 1], str(DEFAULT_PROMPT_NUM))
         self.assertEqual(command[command.index("--prompt_bs") + 1], str(DEFAULT_PROMPT_BATCH_SIZE))
 
-    def test_windows_subprocess_command_uses_memory_safe_prompt_batch(self) -> None:
+    def test_windows_subprocess_command_uses_memory_safe_runtime_knobs(self) -> None:
         command = build_subprocess_command(
             managed_python=self.workspace / "venv" / "Scripts" / "python.exe",
             entrypoint=self.workspace / ".upstream" / "hunyuan3d-part" / "P3-SAM" / "demo" / "auto_mask.py",
@@ -774,15 +783,31 @@ class RuntimeContractTests(unittest.TestCase):
             host_os_name="windows",
         )
 
+        self.assertEqual(command[command.index("--point_num") + 1], str(WINDOWS_DEFAULT_POINT_NUM))
+        self.assertEqual(command[command.index("--prompt_num") + 1], str(WINDOWS_DEFAULT_PROMPT_NUM))
         self.assertEqual(command[command.index("--prompt_bs") + 1], str(WINDOWS_DEFAULT_PROMPT_BATCH_SIZE))
 
-    def test_prompt_batch_env_override_must_be_positive_integer(self) -> None:
+    def test_p3_sam_runtime_knob_env_overrides_must_be_positive_integers(self) -> None:
+        knobs = resolve_p3_sam_runtime_knobs(
+            "windows",
+            env={POINT_NUM_ENV_VAR: "4096", PROMPT_NUM_ENV_VAR: "64", PROMPT_BATCH_SIZE_ENV_VAR: "4"},
+        )
+        self.assertEqual(knobs.to_dict(), {"point_num": 4096, "prompt_num": 64, "prompt_bs": 4})
         self.assertEqual(resolve_prompt_batch_size("windows", env={PROMPT_BATCH_SIZE_ENV_VAR: "4"}), 4)
 
         with self.assertRaises(SetupFailure) as ctx:
             resolve_prompt_batch_size("windows", env={PROMPT_BATCH_SIZE_ENV_VAR: "0"})
 
         self.assertEqual(ctx.exception.code, "invalid_p3_sam_prompt_batch_size")
+
+        for env_var, code in (
+            (POINT_NUM_ENV_VAR, "invalid_p3_sam_point_num"),
+            (PROMPT_NUM_ENV_VAR, "invalid_p3_sam_prompt_num"),
+        ):
+            with self.subTest(env_var=env_var):
+                with self.assertRaises(SetupFailure) as invalid_ctx:
+                    resolve_p3_sam_runtime_knobs("windows", env={env_var: "not-an-int"})
+                self.assertEqual(invalid_ctx.exception.code, code)
 
     def test_p3_sam_artifact_collection_requires_save_mid_res_outputs(self) -> None:
         output_dir = self.workspace / "p3sam-out"
@@ -941,6 +966,9 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "p3_sam_subprocess_failed")
         self.assertIn("return code 2", ctx.exception.message)
         self.assertIn("CUDA out of memory", ctx.exception.message)
+        self.assertIn(f"point_num={DEFAULT_POINT_NUM}", ctx.exception.message)
+        self.assertIn(f"prompt_num={DEFAULT_PROMPT_NUM}", ctx.exception.message)
+        self.assertIn(f"prompt_bs={DEFAULT_PROMPT_BATCH_SIZE}", ctx.exception.message)
         diagnostics = ctx.exception.details["diagnostics"]
         stdout_log = Path(diagnostics["stdout"])
         stderr_log = Path(diagnostics["stderr"])
@@ -955,6 +983,10 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIn(str(stdout_log), ctx.exception.message)
         failure_payload = json.loads(failure_json.read_text(encoding="utf-8"))
         self.assertEqual(failure_payload["returncode"], 2)
+        self.assertEqual(
+            failure_payload["runtime_knobs"],
+            {"point_num": DEFAULT_POINT_NUM, "prompt_num": DEFAULT_PROMPT_NUM, "prompt_bs": DEFAULT_PROMPT_BATCH_SIZE},
+        )
         self.assertEqual(failure_payload["stdout_log"], str(stdout_log))
         self.assertEqual(failure_payload["stderr_log"], str(stderr_log))
         self.assertEqual(failure_payload["stdout_tail"], "stdout details\n")
