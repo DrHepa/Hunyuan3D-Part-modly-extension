@@ -52,7 +52,7 @@ def _attach_semantic_report(
             effective_aabb_path=effective_aabb_path,
             image_evidence=plan.image_evidence,
         )
-    metadata = {**artifacts.metadata, "semantic_report": semantic_report}
+    metadata = {**artifacts.metadata, "semantic_report": semantic_report, "image_evidence": plan.image_evidence}
     return replace(artifacts, metadata=metadata)
 
 
@@ -64,7 +64,7 @@ def _carry_semantic_report(
     semantic_report = source.metadata.get("semantic_report")
     if semantic_report is None:
         return artifacts
-    metadata = {**artifacts.metadata, "semantic_report": semantic_report}
+    metadata = {**artifacts.metadata, "semantic_report": semantic_report, "image_evidence": source.metadata.get("image_evidence")}
     return replace(artifacts, metadata=metadata)
 
 

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .comparison_report import build_comparison_report, build_comparison_summary
 from .config import NormalizedParams, RuntimeContext, new_run_id, stable_artifact_stem
 from .errors import SetupFailure, ValidationError
 
@@ -82,6 +83,41 @@ def _write_semantic_report_sidecar(
         summary = _semantic_report_summary(loaded) if isinstance(loaded, dict) else {"source": str(source)}
         return str(destination.relative_to(output_dir)), summary
     return None, {"warning": "semantic_report_metadata_present_but_unusable", "source": str(semantic_report)}
+
+
+def _prepare_comparison_report_sidecar(
+    *,
+    artifacts: DecompositionArtifacts,
+    params: NormalizedParams,
+    analysis_dir: Path,
+    output_dir: Path,
+    run_id: str,
+    stable_stem: str,
+    output_stem: str,
+) -> tuple[str | None, dict[str, Any] | None, dict[str, Any]]:
+    if params.semantic_resolver != "analysis":
+        return None, None, artifacts.metadata
+    semantic_report = artifacts.metadata.get("semantic_report")
+    if not isinstance(semantic_report, dict):
+        return None, None, artifacts.metadata
+
+    destination = analysis_dir / "comparison_report.json"
+    canonical_path = str(destination.relative_to(output_dir))
+    comparison_report = build_comparison_report(
+        params=params,
+        artifacts=artifacts,
+        semantic_report=semantic_report,
+        image_evidence=artifacts.metadata.get("image_evidence"),
+        canonical_path=canonical_path,
+        run_id=run_id,
+        stable_artifact_stem=stable_stem,
+        output_stem=output_stem,
+    )
+    comparison_summary = build_comparison_summary(comparison_report)
+    updated_semantic_report = {**semantic_report, "comparison_summary": comparison_summary}
+    updated_metadata = {**artifacts.metadata, "semantic_report": updated_semantic_report}
+    _write_json(destination, comparison_report)
+    return canonical_path, comparison_report, updated_metadata
 
 
 def build_observability_record(
@@ -172,10 +208,19 @@ def export_bundle(
         completion_path = str(completion_file.relative_to(output_dir))
     else:
         (output_dir / "completion.json").unlink(missing_ok=True)
+    comparison_report_path, comparison_report, metadata_for_sidecars = _prepare_comparison_report_sidecar(
+        artifacts=artifacts,
+        params=params,
+        analysis_dir=analysis_dir,
+        output_dir=output_dir,
+        run_id=effective_run_id,
+        stable_stem=stable_stem,
+        output_stem=output_stem,
+    )
     semantic_report_path, semantic_report_summary = _write_semantic_report_sidecar(
         output_dir=output_dir,
         analysis_dir=analysis_dir,
-        metadata=artifacts.metadata,
+        metadata=metadata_for_sidecars,
     )
     if semantic_report_path is None:
         (output_dir / "semantic_report.json").unlink(missing_ok=True)
@@ -189,11 +234,12 @@ def export_bundle(
         "bboxes": str(bboxes_path.relative_to(output_dir)),
         "completion": completion_path,
         "semantic_report": semantic_report_path,
+        "comparison_report": comparison_report_path,
     }
     if semantic_report_summary is not None:
         artifact_paths["semantic_summary"] = semantic_report_summary
     export_metadata = {
-        **artifacts.metadata,
+        **metadata_for_sidecars,
         "stable_artifact_stem": stable_stem,
         "run_id": effective_run_id,
         "output_stem": output_stem,
@@ -227,6 +273,7 @@ def export_bundle(
             "bboxes": artifact_paths["bboxes"],
             "completion": artifact_paths["completion"],
             "semantic_report": artifact_paths["semantic_report"],
+            "comparison_report": artifact_paths["comparison_report"],
             "bundle_manifest": artifact_paths["bundle_manifest"],
         },
         "routing_contract": {
@@ -243,6 +290,7 @@ def export_bundle(
             "analysis_dir": artifact_paths["analysis_dir"],
             "analysis_sidecars_are_run_scoped": True,
             "root_sidecars_are_latest_aliases": True,
+            "comparison_report_available": comparison_report_path is not None,
         },
         "metadata": export_metadata,
         "observability": observability,
@@ -257,6 +305,7 @@ def export_bundle(
         "bboxes": str(bboxes_path),
         "completion": str(output_dir / completion_path) if completion_path else None,
         "semantic_report": str(output_dir / semantic_report_path) if semantic_report_path else None,
+        "comparison_report": str(output_dir / comparison_report_path) if comparison_report_path else None,
         "bundle_manifest": str(manifest_path),
         "analysis_dir": str(analysis_dir),
         "observability": observability,

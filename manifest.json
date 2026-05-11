@@ -96,6 +96,7 @@
         "segmentation.json",
         "bboxes.json",
         "semantic_report.json",
+        "comparison_report.json",
         "completion.json",
         "bundle_manifest.json"
       ],
@@ -142,7 +143,7 @@
             { "value": "off", "label": "Off" },
             { "value": "analysis", "label": "Analysis report only" }
           ],
-          "tooltip": "off keeps current behavior unchanged and writes no semantic report. analysis writes diagnostic semantic_report.json only; it does not alter generation, max_parts, output_mode, routing, or X-Part inputs. Guided semantic decomposition is reserved and not accepted in this MVP."
+          "tooltip": "off keeps current behavior unchanged and writes no semantic report. analysis writes diagnostic semantic_report.json plus non-authoritative comparison_report.json sidecars; neither changes generation, max_parts, output_mode, routing, or X-Part inputs. Guided semantic decomposition is reserved and not accepted in this MVP."
         },
         {
           "id": "seed",

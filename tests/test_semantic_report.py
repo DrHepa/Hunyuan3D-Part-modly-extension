@@ -6,9 +6,11 @@ import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
+from runtime.comparison_report import COMPARISON_REPORT_SCHEMA, build_comparison_report, build_comparison_summary
 from runtime.semantic_report import (
     FALLBACK_POLICY,
     SEMANTIC_LEVEL,
@@ -267,6 +269,106 @@ class SemanticReportTests(unittest.TestCase):
         self.assertEqual(report["parts"], [])
         self.assertIn("semantic_report_unavailable", report["warnings"])
         self.assertFalse(report["diagnostics"]["mutates_xpart_inputs"])
+
+
+class ComparisonReportTests(unittest.TestCase):
+    def _artifacts(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            parts=(object(), object()),
+            segmentation={"raw_part_count": 5, "effective_part_count": 3, "max_parts": 5},
+            bboxes={"parts": [{"part_id": "part-0"}, {"part_id": "part-1"}, {"part_id": "part-2"}]},
+            completion={"status": "completed", "resource_limits": {"raw_aabb_count": 5, "effective_aabb_count": 3, "effective_max_parts": 5}},
+            metadata={},
+        )
+
+    def test_comparison_report_classifies_count_mismatches_and_completion(self) -> None:
+        semantic_report = {
+            "effective_part_count": 3,
+            "candidate_groups": {"upper_body_region": ["part-0", "part-1", "part-2"]},
+            "confidence": {"aggregate": 0.2, "level": "low", "publishable": False},
+            "warnings": ["bbox_only_region_inference"],
+        }
+
+        report = build_comparison_report(
+            params={"pipeline_stage": "p3-sam", "max_parts": 5, "seed": 7},
+            artifacts=self._artifacts(),
+            semantic_report=semantic_report,
+            canonical_path="analysis/sample-run/comparison_report.json",
+            run_id="run-a",
+            stable_artifact_stem="sample",
+            output_stem="sample-run-a",
+        )
+
+        self.assertEqual(report["schema"], COMPARISON_REPORT_SCHEMA)
+        self.assertFalse(report["publishable"])
+        self.assertTrue(report["non_authoritative"])
+        self.assertEqual(report["counts"]["requested_max_parts"], 5)
+        self.assertEqual(report["counts"]["exported_parts"], 2)
+        self.assertTrue(report["counts"]["requested_max_parts_is_cap_not_produced_count"])
+        checks = {check["code"]: check for check in report["checks"]}
+        self.assertEqual(checks["requested_gt_exported"]["status"], "warning")
+        self.assertIn("cap", checks["requested_gt_exported"]["message"])
+        self.assertEqual(checks["raw_aabb_trimmed"]["status"], "warning")
+        self.assertEqual(checks["exported_ne_semantic_effective"]["status"], "warning")
+        self.assertEqual(checks["completion_status"]["status"], "pass")
+        self.assertFalse(report["semantic_alignment"]["publishable"])
+        self.assertFalse(report["semantic_alignment"]["candidate_groups_are_labels"])
+
+    def test_comparison_report_marks_missing_completion_and_privacy_metadata_only(self) -> None:
+        artifacts = self._artifacts()
+        artifacts.completion = None
+        image_evidence = {
+            "image_input": {
+                "present": True,
+                "byte_size": 12345,
+                "width": 1254,
+                "height": 1254,
+                "format": "PNG",
+                "mode": "RGB",
+                "path": "/secret/source.png",
+                "hash": "not-allowed",
+                "base64": "not-allowed",
+            }
+        }
+
+        report = build_comparison_report(
+            params={"pipeline_stage": "p3-sam", "max_parts": 5},
+            artifacts=artifacts,
+            semantic_report={"effective_part_count": 2},
+            image_evidence=image_evidence,
+        )
+
+        checks = {check["code"]: check for check in report["checks"]}
+        self.assertEqual(checks["completion_missing"]["status"], "warning")
+        self.assertEqual(report["image_evidence"]["byte_size"], 12345)
+        self.assertEqual(report["image_evidence"]["matching"]["method"], "byte_size_exact")
+        self.assertTrue(report["image_evidence"]["matching"]["local_diagnostic_only"])
+        self.assertFalse(report["image_evidence"]["matching"]["cryptographic_identity"])
+        self.assertFalse(report["privacy"]["stores_image_bytes"])
+        encoded = json.dumps(report, sort_keys=True)
+        for forbidden in ("/secret/source.png", "not-allowed", "stores_image_path\": true", "stores_image_hash\": true", "stores_image_base64\": true"):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_comparison_report_does_not_mutate_inputs_and_builds_short_summary(self) -> None:
+        artifacts = self._artifacts()
+        semantic_report = {"effective_part_count": 3, "warnings": []}
+        before_artifacts = json.dumps({"segmentation": artifacts.segmentation, "bboxes": artifacts.bboxes, "completion": artifacts.completion}, sort_keys=True)
+        before_semantic = json.dumps(semantic_report, sort_keys=True)
+
+        report = build_comparison_report(
+            params={"pipeline_stage": "p3-sam", "max_parts": 5},
+            artifacts=artifacts,
+            semantic_report=semantic_report,
+            canonical_path="analysis/sample/comparison_report.json",
+        )
+        summary = build_comparison_summary(report)
+
+        self.assertEqual(before_artifacts, json.dumps({"segmentation": artifacts.segmentation, "bboxes": artifacts.bboxes, "completion": artifacts.completion}, sort_keys=True))
+        self.assertEqual(before_semantic, json.dumps(semantic_report, sort_keys=True))
+        self.assertEqual(summary["path"], "analysis/sample/comparison_report.json")
+        self.assertIn("requested_gt_exported", summary["warnings"])
+        self.assertTrue(summary["non_authoritative"])
+        self.assertNotIn("checks", summary)
 
 
 class ImageEvidenceTests(unittest.TestCase):

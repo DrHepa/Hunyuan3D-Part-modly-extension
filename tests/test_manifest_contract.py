@@ -92,6 +92,7 @@ class ManifestContractTests(unittest.TestCase):
 
         self.assertIn("sidecars", node)
         self.assertIn("semantic_report.json", node["sidecars"])
+        self.assertIn("comparison_report.json", node["sidecars"])
 
     def test_output_mode_manifest_contract_exposes_visibility_modes(self) -> None:
         node = self.manifest["nodes"][0]
@@ -127,8 +128,8 @@ class ManifestContractTests(unittest.TestCase):
         )
         self.assertIn("off keeps current behavior unchanged", semantic_resolver["tooltip"])
         self.assertIn("writes no semantic report", semantic_resolver["tooltip"])
-        self.assertIn("analysis writes diagnostic semantic_report.json only", semantic_resolver["tooltip"])
-        self.assertIn("does not alter generation", semantic_resolver["tooltip"])
+        self.assertIn("analysis writes diagnostic semantic_report.json plus non-authoritative comparison_report.json sidecars", semantic_resolver["tooltip"])
+        self.assertIn("neither changes generation", semantic_resolver["tooltip"])
         self.assertIn("X-Part inputs", semantic_resolver["tooltip"])
         self.assertIn("Guided semantic decomposition is reserved", semantic_resolver["tooltip"])
         self.assertNotIn("guided", [item["value"] for item in semantic_resolver["options"]])
