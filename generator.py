@@ -129,6 +129,27 @@ class Hunyuan3DPartGenerator(BaseGenerator):
             return f"{blocker['component']} status={blocker['status']}"
         return f"{blocker['component']} is not ready"
 
+    def _runtime_unavailable_message(
+        self,
+        *,
+        blockers: list[dict[str, object]],
+        readiness: Mapping[str, object],
+    ) -> str:
+        components = ",".join(str(blocker.get("component", "unknown")) for blocker in blockers) or "unknown"
+        reason = self._contract_reason(blockers) or "No detailed blocker reason was reported."
+        details = readiness.get("details")
+        if isinstance(details, Mapping):
+            state = (
+                f"setup_ready={bool(details.get('setup_ready', False))}; "
+                f"weights_ready={bool(details.get('weights_ready', False))}; "
+                f"adapter_ready={bool(details.get('adapter_ready', False))}; "
+                f"host_support_ready={bool(details.get('host_support_ready', False))}; "
+                f"inference_supported={bool(details.get('inference_supported', False))}"
+            )
+        else:
+            state = "readiness details unavailable"
+        return f"Runtime unavailable: blockers={components}; reason={reason}; {state}."
+
     def is_downloaded(self) -> bool:
         return self._weight_path().is_file()
 
@@ -353,7 +374,7 @@ class Hunyuan3DPartGenerator(BaseGenerator):
 
         if blockers:
             raise RuntimeFailure(
-                "Inference is intentionally fail-closed until host support, managed setup, runtime adapter, and weights are all ready.",
+                self._runtime_unavailable_message(blockers=blockers, readiness=readiness),
                 code="runtime_unavailable",
                 details={
                     "blockers": blockers,

@@ -1563,6 +1563,10 @@ class RuntimeContractTests(unittest.TestCase):
         blockers = {item["component"] for item in ctx.exception.details["blockers"]}
         self.assertEqual(blockers, {"runtime_adapter", "weights"})
         self.assertEqual(ctx.exception.details["mesh_path"], str(self.mesh.resolve()))
+        self.assertIn("blockers=", ctx.exception.message)
+        self.assertIn("weights_ready=False", ctx.exception.message)
+        self.assertIn("adapter_ready=False", ctx.exception.message)
+        self.assertIn("Missing required model weights", ctx.exception.message)
 
     def test_generator_generate_does_not_block_on_stale_cuda_gate_when_torch_reports_cuda(self) -> None:
         stale_context = resolve_runtime_context(
