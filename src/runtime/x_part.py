@@ -8,7 +8,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from .config import NormalizedParams, resolve_x_part_resource_limits
 from .errors import RuntimeFailure, SetupFailure
@@ -31,6 +31,18 @@ X_PART_MEMORY_GUARD_ENV_VAR = "HUNYUAN3D_PART_MIN_AVAILABLE_MEMORY_GIB"
 DEFAULT_X_PART_TIMEOUT_SECONDS = 30 * 60
 DEFAULT_X_PART_MIN_AVAILABLE_MEMORY_GIB = 16.0
 X_PART_MEMORY_GUARD_POLL_SECONDS = 1.0
+X_PART_DIAGNOSTIC_TAIL_CHARS = 4000
+X_PART_DIAGNOSTIC_TAIL_LINES = 80
+WINDOWS_8GB_SAFE_X_PART_LIMITS = {
+    "num_inference_steps": 10,
+    "octree_resolution": 256,
+    "num_chunks": 8000,
+    "surface_point_count": 4096,
+    "requested_bbox_point_count": 4096,
+    "total_bbox_point_budget": 16384,
+    "min_bbox_point_count": 2048,
+    "torch_dtype": "float16",
+}
 
 
 def runtime_pipeline_path(project_root: Path) -> Path:
@@ -191,6 +203,52 @@ def _part_paths(parts_dir: Path) -> Iterable[Path]:
             yield path
 
 
+def resolve_adapter_x_part_resource_limits(params: NormalizedParams, *, host_os_name: str | None = None) -> dict[str, object]:
+    """Return X-Part limits adapted for the concrete adapter host.
+
+    The global config resolver remains the Linux/default contract.  Windows gets
+    an adapter-only 8GB-safe policy because the managed X-Part subprocess has a
+    weaker memory guard there when ``/proc`` is unavailable and ``psutil`` is not
+    installed.
+    """
+
+    limits = dict(resolve_x_part_resource_limits(params))
+    requested_quality_preset = str(limits.get("quality_preset", params.quality_preset or "balanced"))
+    limits.setdefault("requested_quality_preset", requested_quality_preset)
+    limits.setdefault("effective_quality_preset", requested_quality_preset)
+    limits.setdefault("platform_policy", "default")
+    if (host_os_name or "").lower() != "windows":
+        return limits
+
+    effective_max_parts = int(limits["effective_max_parts"])
+    requested_bbox_point_count = min(int(limits.get("requested_bbox_point_count", limits.get("bbox_point_count", 4096))), int(WINDOWS_8GB_SAFE_X_PART_LIMITS["requested_bbox_point_count"]))
+    total_bbox_point_budget = int(WINDOWS_8GB_SAFE_X_PART_LIMITS["total_bbox_point_budget"])
+    min_bbox_point_count = int(WINDOWS_8GB_SAFE_X_PART_LIMITS["min_bbox_point_count"])
+    adaptive_bbox_point_count = min(
+        requested_bbox_point_count,
+        max(min_bbox_point_count, total_bbox_point_budget // max(1, effective_max_parts)),
+    )
+    limits.update(
+        {
+            "platform_policy": "windows_8gb_safe",
+            "requested_quality_preset": requested_quality_preset,
+            "effective_quality_preset": "fast",
+            "quality_preset": requested_quality_preset,
+            "num_inference_steps": int(WINDOWS_8GB_SAFE_X_PART_LIMITS["num_inference_steps"]),
+            "octree_resolution": int(WINDOWS_8GB_SAFE_X_PART_LIMITS["octree_resolution"]),
+            "num_chunks": min(int(limits.get("num_chunks", WINDOWS_8GB_SAFE_X_PART_LIMITS["num_chunks"])), int(WINDOWS_8GB_SAFE_X_PART_LIMITS["num_chunks"])),
+            "surface_point_count": min(int(limits.get("surface_point_count", WINDOWS_8GB_SAFE_X_PART_LIMITS["surface_point_count"])), int(WINDOWS_8GB_SAFE_X_PART_LIMITS["surface_point_count"])),
+            "requested_bbox_point_count": requested_bbox_point_count,
+            "bbox_point_count": adaptive_bbox_point_count,
+            "total_bbox_point_budget": total_bbox_point_budget,
+            "min_bbox_point_count": min_bbox_point_count,
+            "point_budget_policy": "windows_8gb_safe_cap_total_bbox_points_by_effective_max_parts",
+            "torch_dtype": "float16",
+        }
+    )
+    return limits
+
+
 def collect_artifacts(output_dir: Path) -> DecompositionArtifacts:
     primary_mesh = output_dir / X_PART_PRIMARY_NAME
     segmentation_path = output_dir / "segmentation.json"
@@ -237,6 +295,114 @@ def collect_artifacts(output_dir: Path) -> DecompositionArtifacts:
     )
 
 
+def _tail_text(value: str | None, *, max_chars: int = X_PART_DIAGNOSTIC_TAIL_CHARS, max_lines: int = X_PART_DIAGNOSTIC_TAIL_LINES) -> str:
+    if not value:
+        return ""
+    lines = value.splitlines()[-max_lines:]
+    tail = "\n".join(lines)
+    if value.endswith("\n") and tail:
+        tail += "\n"
+    if len(tail) > max_chars:
+        return tail[-max_chars:]
+    return tail
+
+
+def _existing_artifacts(output_dir: Path) -> list[str]:
+    if not output_dir.is_dir():
+        return []
+    return sorted(str(path) for path in output_dir.iterdir() if path.is_file())
+
+
+def _load_resource_limits_payload(resource_limits_path: Path | None) -> dict[str, object]:
+    if resource_limits_path is None or not resource_limits_path.is_file():
+        return {}
+    try:
+        return json.loads(resource_limits_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"resource_limits_load_error": str(exc)}
+
+
+def _resource_limits_summary(resource_limits: Mapping[str, object] | None) -> dict[str, object]:
+    if not resource_limits:
+        return {}
+    keys = (
+        "effective_max_parts",
+        "max_parts_hard_cap",
+        "quality_preset",
+        "requested_quality_preset",
+        "effective_quality_preset",
+        "platform_policy",
+        "num_inference_steps",
+        "octree_resolution",
+        "num_chunks",
+        "surface_point_count",
+        "bbox_point_count",
+        "requested_bbox_point_count",
+        "total_bbox_point_budget",
+        "min_bbox_point_count",
+        "point_budget_policy",
+        "torch_dtype",
+        "resolved_torch_dtype",
+    )
+    return {key: resource_limits[key] for key in keys if key in resource_limits}
+
+
+def _last_memory_event(resource_limits: Mapping[str, object] | None) -> dict[str, object] | None:
+    trace = resource_limits.get("memory_trace") if resource_limits else None
+    if isinstance(trace, list) and trace and isinstance(trace[-1], dict):
+        return trace[-1]
+    return None
+
+
+def _format_resource_summary(summary: Mapping[str, object]) -> str:
+    return ", ".join(f"{key}={value}" for key, value in summary.items())
+
+
+def _format_failure_message(
+    *,
+    reason: str,
+    diagnostics: Mapping[str, str],
+    output_dir: Path,
+    resource_limits_path: Path,
+    resource_summary: Mapping[str, object],
+    stdout_tail: str,
+    stderr_tail: str,
+    existing_artifacts: Iterable[str],
+    returncode: int | None = None,
+    timeout_seconds: int | None = None,
+    last_memory_stage: object | None = None,
+    last_memory_event: Mapping[str, object] | None = None,
+) -> str:
+    first_line = reason
+    if timeout_seconds is not None:
+        first_line = f"{first_line} after {timeout_seconds} seconds."
+    elif returncode is not None:
+        first_line = f"{first_line} with return code {returncode}."
+    lines = [
+        first_line,
+        "Persisted diagnostics:",
+        f"- failure_json: {diagnostics.get('failure')}",
+        f"- stderr_log: {diagnostics.get('stderr')}",
+        f"- stdout_log: {diagnostics.get('stdout')}",
+        f"- output_dir: {output_dir}",
+        f"- resource_limits_json: {resource_limits_path}",
+    ]
+    if resource_summary:
+        lines.append(f"Resource summary: {_format_resource_summary(resource_summary)}")
+    if last_memory_stage is not None:
+        lines.append(f"Last memory stage: {last_memory_stage}")
+    if last_memory_event:
+        lines.append(f"Last memory event: {json.dumps(dict(last_memory_event), sort_keys=True)}")
+    artifact_list = list(existing_artifacts)
+    if artifact_list:
+        lines.extend(["Existing artifacts:", *[f"- {path}" for path in artifact_list]])
+    if stderr_tail:
+        lines.extend(["", "stderr tail:", stderr_tail.rstrip()])
+    if stdout_tail:
+        lines.extend(["", "stdout tail:", stdout_tail.rstrip()])
+    return "\n".join(lines)
+
+
 def _persist_failure_diagnostics(
     *,
     output_dir: Path,
@@ -249,12 +415,17 @@ def _persist_failure_diagnostics(
     timeout_seconds: int | None = None,
     timed_out: bool = False,
     memory_guard: dict[str, object] | None = None,
+    adapter_resource_limits: Mapping[str, object] | None = None,
 ) -> dict[str, str]:
     stdout_path = output_dir / X_PART_STDOUT_LOG_NAME
     stderr_path = output_dir / X_PART_STDERR_LOG_NAME
     failure_path = output_dir / X_PART_FAILURE_JSON_NAME
     stdout_path.write_text(result.stdout or "", encoding="utf-8")
     stderr_path.write_text(result.stderr or "", encoding="utf-8")
+    stdout_tail = _tail_text(result.stdout)
+    stderr_tail = _tail_text(result.stderr)
+    resource_limits_payload = _load_resource_limits_payload(resource_limits_path)
+    resource_limits_summary = _resource_limits_summary(resource_limits_payload or adapter_resource_limits)
     failure_path.write_text(
         json.dumps(
             {
@@ -274,6 +445,11 @@ def _persist_failure_diagnostics(
                 },
                 "stdout_log": str(stdout_path),
                 "stderr_log": str(stderr_path),
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "existing_artifacts": _existing_artifacts(output_dir),
+                "resource_limits_summary": resource_limits_summary,
+                "resource_limits_payload": resource_limits_payload,
             },
             indent=2,
             sort_keys=True,
@@ -432,9 +608,18 @@ def _run_with_memory_guard(
     )
 
 
-def _build_subprocess_script(*, runtime_root: Path, bundle_root: Path, mesh_path: Path, output_dir: Path, params: NormalizedParams, aabb_path: Path | None) -> str:
+def _build_subprocess_script(
+    *,
+    runtime_root: Path,
+    bundle_root: Path,
+    mesh_path: Path,
+    output_dir: Path,
+    params: NormalizedParams,
+    aabb_path: Path | None,
+    host_os_name: str | None = None,
+) -> str:
     x_part_root = x_part_import_root(runtime_root / X_PART_PIPELINE_RELATIVE_PATH)
-    limits = resolve_x_part_resource_limits(params)
+    limits = resolve_adapter_x_part_resource_limits(params, host_os_name=host_os_name)
     seed = params.seed if params.seed is not None else 42
     return "\n".join(
         [
@@ -667,6 +852,7 @@ def run_upstream_x_part(
     timeout_seconds = _resolve_x_part_timeout_seconds()
     min_available_gib = _resolve_x_part_min_available_memory_gib()
     resource_limits_path = output_dir / X_PART_RESOURCE_LIMITS_JSON_NAME
+    adapter_resource_limits = resolve_adapter_x_part_resource_limits(plan.params, host_os_name=plan.context.host_facts.os_name)
     script = _build_subprocess_script(
         runtime_root=runtime_root,
         bundle_root=bundle_root,
@@ -674,12 +860,13 @@ def run_upstream_x_part(
         output_dir=output_dir,
         params=plan.params,
         aabb_path=aabb_path,
+        host_os_name=plan.context.host_facts.os_name,
     )
     command = subprocess_command(managed_python, "-c", script)
     subprocess_env = build_runtime_env(
         os.environ,
         pythonpath=(runtime_root, x_part_import_root(runtime_root / X_PART_PIPELINE_RELATIVE_PATH)),
-        extra={"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1"},
+        extra={"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1", "PYTHONFAULTHANDLER": "1"},
     )
     memory_guard: dict[str, object] | None = None
     try:
@@ -715,24 +902,45 @@ def run_upstream_x_part(
             cwd=str(runtime_root / "XPart"),
             result=result,
             aabb_path=aabb_path,
-            resource_limits_path=resource_limits_path if resource_limits_path.exists() else None,
+            resource_limits_path=resource_limits_path,
             timeout_seconds=timeout_seconds,
             timed_out=True,
             memory_guard=memory_guard,
+            adapter_resource_limits=adapter_resource_limits,
         )
+        resource_limits_payload = _load_resource_limits_payload(resource_limits_path)
+        resource_source = resource_limits_payload or adapter_resource_limits
+        stdout_tail = _tail_text(result.stdout)
+        stderr_tail = _tail_text(result.stderr)
+        existing_artifacts = _existing_artifacts(output_dir)
         raise RuntimeFailure(
-            "Upstream X-Part subprocess timed out. See persisted diagnostics in the output directory.",
+            _format_failure_message(
+                reason="Upstream X-Part subprocess timed out",
+                diagnostics=diagnostics,
+                output_dir=output_dir,
+                resource_limits_path=resource_limits_path,
+                resource_summary=_resource_limits_summary(resource_source),
+                stdout_tail=stdout_tail,
+                stderr_tail=stderr_tail,
+                existing_artifacts=existing_artifacts,
+                timeout_seconds=timeout_seconds,
+                last_memory_stage=resource_source.get("last_memory_stage") if isinstance(resource_source, dict) else None,
+                last_memory_event=_last_memory_event(resource_source if isinstance(resource_source, dict) else {}),
+            ),
             code="x_part_subprocess_timeout",
             details={
                 "timeout_seconds": timeout_seconds,
-                "stdout": result.stdout[-4000:],
-                "stderr": result.stderr[-4000:],
+                "stdout": stdout_tail,
+                "stderr": stderr_tail,
                 "bundle_root": str(bundle_root),
                 "mesh_path": str(plan.mesh.mesh_path),
                 "output_dir": str(output_dir),
                 "aabb_path": str(aabb_path) if aabb_path is not None else None,
                 "diagnostics": diagnostics,
                 "memory_guard": memory_guard,
+                "resource_limits_path": str(resource_limits_path),
+                "resource_limits_summary": _resource_limits_summary(resource_source),
+                "existing_artifacts": existing_artifacts,
             },
         ) from exc
     if result.returncode != 0:
@@ -744,23 +952,45 @@ def run_upstream_x_part(
             cwd=str(runtime_root / "XPart"),
             result=result,
             aabb_path=aabb_path,
-            resource_limits_path=resource_limits_path if resource_limits_path.exists() else None,
+            resource_limits_path=resource_limits_path,
             timeout_seconds=timeout_seconds,
             memory_guard=memory_guard,
+            adapter_resource_limits=adapter_resource_limits,
         )
+        resource_limits_payload = _load_resource_limits_payload(resource_limits_path)
+        resource_source = resource_limits_payload or adapter_resource_limits
+        stdout_tail = _tail_text(result.stdout)
+        stderr_tail = _tail_text(result.stderr)
+        existing_artifacts = _existing_artifacts(output_dir)
+        reason = "Upstream X-Part subprocess was stopped by the memory guard" if memory_guard_triggered else "Upstream X-Part subprocess failed"
         raise RuntimeFailure(
-            "Upstream X-Part subprocess was stopped by the memory guard." if memory_guard_triggered else "Upstream X-Part subprocess failed.",
+            _format_failure_message(
+                reason=reason,
+                diagnostics=diagnostics,
+                output_dir=output_dir,
+                resource_limits_path=resource_limits_path,
+                resource_summary=_resource_limits_summary(resource_source),
+                stdout_tail=stdout_tail,
+                stderr_tail=stderr_tail,
+                existing_artifacts=existing_artifacts,
+                returncode=result.returncode,
+                last_memory_stage=resource_source.get("last_memory_stage") if isinstance(resource_source, dict) else None,
+                last_memory_event=_last_memory_event(resource_source if isinstance(resource_source, dict) else {}),
+            ),
             code="x_part_memory_guard_triggered" if memory_guard_triggered else "x_part_subprocess_failed",
             details={
                 "returncode": result.returncode,
-                "stdout": result.stdout[-4000:],
-                "stderr": result.stderr[-4000:],
+                "stdout": stdout_tail,
+                "stderr": stderr_tail,
                 "bundle_root": str(bundle_root),
                 "mesh_path": str(plan.mesh.mesh_path),
                 "output_dir": str(output_dir),
                 "aabb_path": str(aabb_path) if aabb_path is not None else None,
                 "diagnostics": diagnostics,
                 "memory_guard": memory_guard,
+                "resource_limits_path": str(resource_limits_path),
+                "resource_limits_summary": _resource_limits_summary(resource_source),
+                "existing_artifacts": existing_artifacts,
             },
         )
     return collect_artifacts(output_dir)

@@ -79,6 +79,7 @@ from runtime.x_part import (
     _build_subprocess_script,
     _resolve_x_part_min_available_memory_gib,
     _run_with_memory_guard,
+    resolve_adapter_x_part_resource_limits,
     resolve_bundle_root,
     run_upstream_x_part,
     verify_x_part_import_smoke,
@@ -349,6 +350,31 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(limits["surface_point_count"], 8192)
         self.assertEqual(limits["bbox_point_count"], 8192)
         self.assertEqual(limits["total_bbox_point_budget"], 65536)
+
+    def test_x_part_adapter_preserves_linux_limits_and_applies_windows_8gb_safe_policy(self) -> None:
+        params = normalize_params({"pipeline_stage": "x-part", "quality_preset": "balanced", "max_parts": 5})
+
+        linux_limits = resolve_adapter_x_part_resource_limits(params, host_os_name="linux")
+        windows_limits = resolve_adapter_x_part_resource_limits(params, host_os_name="windows")
+
+        self.assertEqual(linux_limits["platform_policy"], "default")
+        self.assertEqual(linux_limits["num_inference_steps"], 30)
+        self.assertEqual(linux_limits["octree_resolution"], 380)
+        self.assertEqual(linux_limits["num_chunks"], 12000)
+        self.assertEqual(linux_limits["surface_point_count"], 8192)
+        self.assertEqual(linux_limits["bbox_point_count"], 8192)
+        self.assertEqual(windows_limits["platform_policy"], "windows_8gb_safe")
+        self.assertEqual(windows_limits["requested_quality_preset"], "balanced")
+        self.assertEqual(windows_limits["effective_quality_preset"], "fast")
+        self.assertEqual(windows_limits["effective_max_parts"], 5)
+        self.assertEqual(windows_limits["num_inference_steps"], 10)
+        self.assertEqual(windows_limits["octree_resolution"], 256)
+        self.assertLessEqual(windows_limits["num_chunks"], 8000)
+        self.assertLessEqual(windows_limits["surface_point_count"], 4096)
+        self.assertLessEqual(windows_limits["bbox_point_count"], 4096)
+        self.assertEqual(windows_limits["total_bbox_point_budget"], 16384)
+        self.assertEqual(windows_limits["min_bbox_point_count"], 2048)
+        self.assertEqual(windows_limits["torch_dtype"], "float16")
 
     def test_x_part_resource_limits_fail_closed_above_hard_part_cap(self) -> None:
         with self.assertRaises(ValidationError) as ctx:
@@ -1147,6 +1173,33 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIn("scene = result[0] if isinstance(result, (list, tuple)) else result", script)
         self.assertNotIn("max_parts=max_parts", script)
 
+    def test_x_part_subprocess_script_uses_windows_safe_limits_when_host_is_windows(self) -> None:
+        runtime_root = runtime_source_root(self.workspace)
+        plan = build_execution_plan(
+            {"mesh": self.mesh},
+            {"pipeline_stage": "x-part", "quality_preset": "balanced", "max_parts": 5},
+            runtime_context=self.ready_context,
+        )
+
+        script = _build_subprocess_script(
+            runtime_root=runtime_root,
+            bundle_root=self.workspace / "managed-models" / "hunyuan3d-part" / "p3sam",
+            mesh_path=self.mesh,
+            output_dir=self.workspace / "xpart-out",
+            params=plan.params,
+            aabb_path=None,
+            host_os_name="windows",
+        )
+
+        self.assertIn("'platform_policy': 'windows_8gb_safe'", script)
+        self.assertIn("'requested_quality_preset': 'balanced'", script)
+        self.assertIn("'effective_quality_preset': 'fast'", script)
+        self.assertIn("'num_inference_steps': 10", script)
+        self.assertIn("'octree_resolution': 256", script)
+        self.assertIn("'num_chunks': 8000", script)
+        self.assertIn("'surface_point_count': 4096", script)
+        self.assertIn("'torch_dtype': 'float16'", script)
+
     def test_x_part_adapter_fails_closed_when_bundle_is_missing(self) -> None:
         plan = build_execution_plan(
             {"mesh": self.mesh},
@@ -1231,7 +1284,29 @@ class RuntimeContractTests(unittest.TestCase):
         output_dir = self.workspace / "xpart-out"
         bundle_root = self._create_valid_x_part_bundle(self.workspace / "managed-models" / "hunyuan3d-part" / "p3sam")
 
-        def failing_runner(_command, **_kwargs):
+        def failing_runner(_command, **kwargs):
+            self.assertEqual(kwargs["env"]["PYTHONFAULTHANDLER"], "1")
+            (output_dir / "x_part_resource_limits.json").write_text(
+                json.dumps(
+                    {
+                        "effective_max_parts": 32,
+                        "quality_preset": "balanced",
+                        "requested_quality_preset": "balanced",
+                        "effective_quality_preset": "balanced",
+                        "platform_policy": "default",
+                        "num_inference_steps": 30,
+                        "octree_resolution": 380,
+                        "num_chunks": 12000,
+                        "surface_point_count": 8192,
+                        "bbox_point_count": 8192,
+                        "torch_dtype": "float32",
+                        "last_memory_stage": "before_pipeline_call",
+                        "memory_trace": [{"stage": "before_pipeline_call", "process_rss_gib": 6.5}],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             return mock.Mock(returncode=7, stdout="xpart stdout\n", stderr="xpart stderr\n")
 
         with mock.patch(
@@ -1250,6 +1325,22 @@ class RuntimeContractTests(unittest.TestCase):
                 )
 
         self.assertEqual(ctx.exception.code, "x_part_subprocess_failed")
+        self.assertIn("return code 7", ctx.exception.message)
+        self.assertIn("x_part_failure.json", ctx.exception.message)
+        self.assertIn("x_part_stderr.log", ctx.exception.message)
+        self.assertIn("x_part_stdout.log", ctx.exception.message)
+        self.assertIn("resource_limits_json", ctx.exception.message)
+        self.assertIn("effective_max_parts=32", ctx.exception.message)
+        self.assertIn("quality_preset=balanced", ctx.exception.message)
+        self.assertIn("num_inference_steps=30", ctx.exception.message)
+        self.assertIn("octree_resolution=380", ctx.exception.message)
+        self.assertIn("num_chunks=12000", ctx.exception.message)
+        self.assertIn("surface_point_count=8192", ctx.exception.message)
+        self.assertIn("bbox_point_count=8192", ctx.exception.message)
+        self.assertIn("torch_dtype=float32", ctx.exception.message)
+        self.assertIn("Last memory stage: before_pipeline_call", ctx.exception.message)
+        self.assertIn("xpart stderr", ctx.exception.message)
+        self.assertIn("xpart stdout", ctx.exception.message)
         self.assertEqual(ctx.exception.details["mesh_path"], str(self.mesh))
         self.assertEqual(ctx.exception.details["output_dir"], str(output_dir))
         diagnostics = ctx.exception.details["diagnostics"]
@@ -1270,6 +1361,14 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(failure_payload["stdout_log"], str(stdout_log))
         self.assertEqual(failure_payload["stderr_log"], str(stderr_log))
         self.assertEqual(failure_payload["script_summary"]["entrypoint"], "XPart/partgen/partformer_pipeline.py")
+        self.assertEqual(failure_payload["stdout_tail"], "xpart stdout\n")
+        self.assertEqual(failure_payload["stderr_tail"], "xpart stderr\n")
+        self.assertIn(str(stdout_log), failure_payload["existing_artifacts"])
+        self.assertIn(str(stderr_log), failure_payload["existing_artifacts"])
+        self.assertEqual(failure_payload["resource_limits_summary"]["effective_max_parts"], 32)
+        self.assertEqual(failure_payload["resource_limits_summary"]["num_inference_steps"], 30)
+        self.assertEqual(failure_payload["resource_limits_summary"]["torch_dtype"], "float32")
+        self.assertEqual(failure_payload["resource_limits_payload"]["last_memory_stage"], "before_pipeline_call")
 
     def test_run_upstream_x_part_timeout_persists_failure_diagnostics(self) -> None:
         plan = build_execution_plan(
@@ -1284,6 +1383,24 @@ class RuntimeContractTests(unittest.TestCase):
         self._create_valid_x_part_bundle(self.workspace / "managed-models" / "hunyuan3d-part" / "p3sam")
 
         def timeout_runner(command, **kwargs):
+            (output_dir / "x_part_resource_limits.json").write_text(
+                json.dumps(
+                    {
+                        "effective_max_parts": 32,
+                        "quality_preset": "balanced",
+                        "num_inference_steps": 30,
+                        "octree_resolution": 380,
+                        "num_chunks": 12000,
+                        "surface_point_count": 8192,
+                        "bbox_point_count": 8192,
+                        "torch_dtype": "float32",
+                        "last_memory_stage": "after_partgen_import",
+                        "memory_trace": [{"stage": "after_partgen_import"}],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             raise subprocess.TimeoutExpired(command, kwargs["timeout"], output="partial stdout", stderr="partial stderr")
 
         with mock.patch(
@@ -1301,10 +1418,19 @@ class RuntimeContractTests(unittest.TestCase):
                 )
 
         self.assertEqual(ctx.exception.code, "x_part_subprocess_timeout")
+        self.assertIn("after 1800 seconds", ctx.exception.message)
+        self.assertIn("x_part_failure.json", ctx.exception.message)
+        self.assertIn("resource_limits_json", ctx.exception.message)
+        self.assertIn("partial stderr", ctx.exception.message)
+        self.assertIn("partial stdout", ctx.exception.message)
+        self.assertIn("Last memory stage: after_partgen_import", ctx.exception.message)
         diagnostics = ctx.exception.details["diagnostics"]
         failure_payload = json.loads(Path(diagnostics["failure"]).read_text(encoding="utf-8"))
         self.assertTrue(failure_payload["timed_out"])
         self.assertEqual(failure_payload["returncode"], -9)
+        self.assertIn("partial stdout", failure_payload["stdout_tail"])
+        self.assertIn("partial stderr", failure_payload["stderr_tail"])
+        self.assertEqual(failure_payload["resource_limits_payload"]["last_memory_stage"], "after_partgen_import")
         self.assertIn("partial stdout", Path(diagnostics["stdout"]).read_text(encoding="utf-8"))
         self.assertIn("timed out", Path(diagnostics["stderr"]).read_text(encoding="utf-8"))
 
