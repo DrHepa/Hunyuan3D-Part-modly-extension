@@ -40,12 +40,11 @@ This README intentionally does not claim a CLI/headless install path. Follow the
 
 The extension declares one model node:
 
-- `decompose-mesh` — decomposes a required input mesh, optionally using a front image as auxiliary evidence.
+- `decompose-mesh` — decomposes a required input mesh. The manifest exposes this as a single mesh-primary renderer node; optional image evidence is runtime-only and is not declared as a renderer input.
 
 Inputs:
 
 - `mesh` — required mesh input: `glb`, `obj`, `stl`, or `ply`.
-- `front` — optional image input: `png`, `jpg`, `jpeg`, or `webp`.
 
 Output:
 

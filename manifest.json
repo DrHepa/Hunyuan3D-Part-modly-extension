@@ -32,7 +32,7 @@
     "hf_repo": "tencent/Hunyuan3D-Part",
     "download_check": "p3sam/p3sam.safetensors",
     "weight_owner_id": "p3sam",
-    "workflow_constraint": "Primary workflow input must remain image or text; mesh is exposed as a required secondary named input.",
+    "workflow_constraint": "Single mesh-primary node. Optional image evidence is supported only by runtime params/evidence paths and is not declared as a renderer input in this manifest.",
     "windows_setup_readiness": "compatible-for-setup-and-readiness-probes",
     "windows_inference_requires_native_probe": true,
     "public_release_readiness": "Windows release metadata is readiness/setup compatible; full Windows NVIDIA inference is not advertised until CUDA and native dependency probes pass on the target host.",
@@ -55,28 +55,16 @@
       "id": "decompose-mesh",
       "name": "Decompose Mesh",
       "label": "Decompose Mesh",
-      "input": "image",
+      "input": "mesh",
       "output": "mesh",
       "hf_repo": "tencent/Hunyuan3D-Part",
       "download_check": "p3sam/p3sam.safetensors",
       "weight_owner_id": "p3sam",
-      "input_mode": "image-conditioned-mesh",
+      "input_mode": "mesh-guided-decomposition",
       "inputs": [
-        "image",
         "mesh"
       ],
       "input_contract": [
-        {
-          "name": "front",
-          "type": "image",
-          "required": false,
-          "formats": [
-            "png",
-            "jpg",
-            "jpeg",
-            "webp"
-          ]
-        },
         {
           "name": "mesh",
           "type": "mesh",
