@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import stat
@@ -141,6 +142,26 @@ class RuntimeContractTests(unittest.TestCase):
             (bundle_root / dirname).mkdir(parents=True, exist_ok=True)
         (bundle_root / "config.json").write_text("{}\n", encoding="utf-8")
         return bundle_root
+
+    def _ready_adapter_readiness(self) -> AdapterReadiness:
+        managed_python = self.workspace / "venv" / "bin" / "python"
+        managed_python.parent.mkdir(parents=True, exist_ok=True)
+        managed_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        weight_path = self.injected_model_dir / "p3sam.safetensors"
+        weight_path.write_bytes(b"weights")
+        return AdapterReadiness(
+            ready=True,
+            status="ready",
+            paths=None,
+            components={
+                "managed_python": {"ready": True, "status": "ready"},
+                "runtime_source": {"ready": True, "status": "ready"},
+                "entrypoint": {"ready": True, "status": "ready"},
+                "import_smoke": {"ready": True, "status": "ready"},
+                "weights": {"ready": True, "status": "ready", "path": str(weight_path)},
+            },
+            message="Runtime adapter ready.",
+        )
 
     def test_validate_inputs_rejects_unsupported_mesh(self) -> None:
         bad_mesh = self.workspace / "mesh.fbx"
@@ -1742,7 +1763,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertTrue(generator._shell_loaded)
         self.assertFalse(generator.readiness_status()["inference_ready"])
 
-    def test_generator_generate_requires_mesh_path_param(self) -> None:
+    def test_generator_generate_requires_primary_or_param_mesh_input(self) -> None:
         generator = Hunyuan3DPartGenerator(
             self.injected_model_dir,
             self.workspace,
@@ -1752,6 +1773,95 @@ class RuntimeContractTests(unittest.TestCase):
         with self.assertRaises(ValidationError) as ctx:
             generator.generate(b"image-bytes", {"pipeline_stage": "p3-sam"})
         self.assertEqual(ctx.exception.code, "missing_mesh_input")
+        self.assertIn("primary mesh input or params.mesh_path", ctx.exception.message)
+
+    def test_generator_generate_accepts_primary_mesh_path_before_runtime_gate(self) -> None:
+        generator = Hunyuan3DPartGenerator(
+            self.injected_model_dir,
+            self.workspace,
+            project_root=self.workspace,
+            runtime_context=self.ready_shell_context,
+        )
+        with self.assertRaises(RuntimeFailure) as ctx:
+            generator.generate(str(self.mesh), {"pipeline_stage": "p3-sam"})
+        self.assertEqual(ctx.exception.code, "runtime_unavailable")
+        self.assertEqual(ctx.exception.details["mesh_path"], str(self.mesh.resolve()))
+        self.assertFalse(ctx.exception.details["image_input_present"])
+
+    def test_generator_generate_routes_primary_mesh_path_to_decompose_when_runtime_ready(self) -> None:
+        generator = Hunyuan3DPartGenerator(
+            self.injected_model_dir,
+            self.workspace,
+            project_root=self.workspace,
+            runtime_context=self.ready_shell_context,
+        )
+        adapter_readiness = self._ready_adapter_readiness()
+
+        with (
+            mock.patch("generator.probe_torch_cuda_availability", return_value=True),
+            mock.patch("generator.build_adapter_readiness", return_value=adapter_readiness),
+            mock.patch("generator.decompose_mesh", return_value={"primary_mesh": str(self.mesh), "status": "ok"}) as decompose_mock,
+        ):
+            result = generator.generate(str(self.mesh), {"pipeline_stage": "p3-sam"})
+
+        self.assertEqual(result, str(self.mesh))
+        decompose_mock.assert_called_once()
+        call_args, call_kwargs = decompose_mock.call_args
+        self.assertEqual(call_args[0], {"mesh": self.mesh.resolve()})
+        image_evidence = call_kwargs["image_evidence"]
+        self.assertEqual(image_evidence["image_evidence"]["status"], "absent")
+
+    def test_generator_generate_persists_primary_glb_bytes_to_decompose_when_runtime_ready(self) -> None:
+        generator = Hunyuan3DPartGenerator(
+            self.injected_model_dir,
+            self.workspace,
+            project_root=self.workspace,
+            runtime_context=self.ready_shell_context,
+        )
+        adapter_readiness = self._ready_adapter_readiness()
+        mesh_bytes = b"glTF-primary-mesh-bytes"
+
+        with (
+            mock.patch("generator.probe_torch_cuda_availability", return_value=True),
+            mock.patch("generator.build_adapter_readiness", return_value=adapter_readiness),
+            mock.patch("generator.decompose_mesh", return_value={"primary_mesh": str(self.mesh), "status": "ok"}) as decompose_mock,
+        ):
+            result = generator.generate(mesh_bytes, {"pipeline_stage": "p3-sam"})
+
+        self.assertEqual(result, str(self.mesh))
+        decompose_mock.assert_called_once()
+        call_args, call_kwargs = decompose_mock.call_args
+        persisted_mesh = call_args[0]["mesh"]
+        self.assertEqual(persisted_mesh.suffix, ".glb")
+        self.assertIn(".primary-inputs", persisted_mesh.parts)
+        self.assertEqual(persisted_mesh.read_bytes(), mesh_bytes)
+        image_evidence = call_kwargs["image_evidence"]
+        self.assertEqual(image_evidence["image_evidence"]["status"], "absent")
+
+    def test_generator_generate_persists_primary_glb_base64_to_decompose_when_runtime_ready(self) -> None:
+        generator = Hunyuan3DPartGenerator(
+            self.injected_model_dir,
+            self.workspace,
+            project_root=self.workspace,
+            runtime_context=self.ready_shell_context,
+        )
+        adapter_readiness = self._ready_adapter_readiness()
+        mesh_bytes = b"glTF-primary-mesh-base64"
+        mesh_base64 = base64.b64encode(mesh_bytes).decode("ascii")
+
+        with (
+            mock.patch("generator.probe_torch_cuda_availability", return_value=True),
+            mock.patch("generator.build_adapter_readiness", return_value=adapter_readiness),
+            mock.patch("generator.decompose_mesh", return_value={"primary_mesh": str(self.mesh), "status": "ok"}) as decompose_mock,
+        ):
+            result = generator.generate(mesh_base64, {"pipeline_stage": "p3-sam"})
+
+        self.assertEqual(result, str(self.mesh))
+        decompose_mock.assert_called_once()
+        persisted_mesh = decompose_mock.call_args[0][0]["mesh"]
+        self.assertEqual(persisted_mesh.suffix, ".glb")
+        self.assertIn(".primary-inputs", persisted_mesh.parts)
+        self.assertEqual(persisted_mesh.read_bytes(), mesh_bytes)
 
     def test_generator_generate_refuses_to_fake_inference(self) -> None:
         generator = Hunyuan3DPartGenerator(

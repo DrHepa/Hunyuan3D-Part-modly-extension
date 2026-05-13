@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import sys
 import os
 from pathlib import Path
@@ -34,6 +37,9 @@ from runtime.validate import validate_mesh_path
 
 class Hunyuan3DPartGenerator(BaseGenerator):
     """Managed-extension generator with a fail-closed P3-SAM adapter path."""
+
+    _MESH_SUFFIXES = {".glb", ".obj", ".stl", ".ply"}
+    _MESH_PATH_ALIASES = ("mesh_path", "mesh", "path", "file_path", "filePath", "local_path", "workspace_path")
 
     weight_owner_id = "p3sam"
     hf_repo = "tencent/Hunyuan3D-Part"
@@ -339,6 +345,113 @@ class Hunyuan3DPartGenerator(BaseGenerator):
             resolved_params.update(dict(kwargs))
         return resolved_image, resolved_params
 
+    def _output_root(self) -> Path:
+        return Path(getattr(self, "outputs_dir", None) or self.runtime_context.paths.artifacts_root)
+
+    def _is_mesh_path_like(self, value: object) -> bool:
+        if not isinstance(value, (str, Path)):
+            return False
+        return Path(value).suffix.lower() in self._MESH_SUFFIXES
+
+    def _mesh_candidate_from_mapping(self, payload: Mapping[str, object]) -> object | None:
+        for key in self._MESH_PATH_ALIASES:
+            candidate = payload.get(key)
+            if candidate is None:
+                continue
+            if isinstance(candidate, Mapping):
+                nested = self._mesh_candidate_from_mapping(candidate)
+                if nested is not None:
+                    return nested
+            elif isinstance(candidate, (str, Path, bytes, bytearray, memoryview)):
+                return candidate
+        return None
+
+    def _decode_primary_mesh_base64(self, value: str) -> bytes | None:
+        try:
+            decoded = base64.b64decode(value.strip(), validate=True)
+        except (binascii.Error, ValueError):
+            return None
+        return decoded if decoded.startswith(b"glTF") else None
+
+    def _persist_primary_mesh_bytes(self, mesh_bytes: bytes, output_root: Path) -> Path:
+        if not mesh_bytes.startswith(b"glTF"):
+            raise ValidationError(
+                "The required mesh input must be provided as the primary mesh input or params.mesh_path; byte/base64 payloads must be an identifiable GLB starting with the glTF magic.",
+                code="missing_mesh_input",
+                details={
+                    "accepted_primary_inputs": [
+                        "path string with .glb/.obj/.stl/.ply suffix",
+                        "mapping containing mesh/path/file_path/filePath/local_path/workspace_path",
+                        "GLB bytes beginning with glTF magic",
+                        "base64-encoded GLB string beginning with glTF after decoding",
+                    ],
+                    "accepted_params": ["mesh_path", "mesh"],
+                },
+            )
+
+        digest = hashlib.sha256(mesh_bytes).hexdigest()[:16]
+        primary_inputs = output_root / ".primary-inputs"
+        primary_inputs.mkdir(parents=True, exist_ok=True)
+        mesh_path = primary_inputs / f"primary-mesh-{digest}.glb"
+        if not mesh_path.exists() or mesh_path.read_bytes() != mesh_bytes:
+            mesh_path.write_bytes(mesh_bytes)
+        return mesh_path
+
+    def _coerce_mesh_candidate(self, candidate: object, output_root: Path) -> object:
+        if isinstance(candidate, (bytes, bytearray, memoryview)):
+            return self._persist_primary_mesh_bytes(bytes(candidate), output_root)
+        if isinstance(candidate, str) and not self._is_mesh_path_like(candidate):
+            decoded_mesh = self._decode_primary_mesh_base64(candidate)
+            if decoded_mesh is not None:
+                return self._persist_primary_mesh_bytes(decoded_mesh, output_root)
+        return candidate
+
+    def _resolve_mesh_input(
+        self,
+        primary_input: object,
+        params: Mapping[str, object],
+        *,
+        output_root: Path,
+    ) -> tuple[object, object | None]:
+        """Return ``(mesh_candidate, image_evidence_input)`` for legacy and mesh-primary calls."""
+        legacy_mesh_path = params.get("mesh_path")
+        if legacy_mesh_path is not None:
+            return self._coerce_mesh_candidate(legacy_mesh_path, output_root), primary_input
+
+        params_mesh = self._mesh_candidate_from_mapping(params)
+        if params_mesh is not None:
+            return self._coerce_mesh_candidate(params_mesh, output_root), primary_input
+
+        if self._is_mesh_path_like(primary_input):
+            return primary_input, None
+
+        if isinstance(primary_input, Mapping):
+            candidate = self._mesh_candidate_from_mapping(primary_input)
+            if candidate is not None:
+                return self._coerce_mesh_candidate(candidate, output_root), None
+
+        if isinstance(primary_input, str):
+            decoded_mesh = self._decode_primary_mesh_base64(primary_input)
+            if decoded_mesh is not None:
+                return self._persist_primary_mesh_bytes(decoded_mesh, output_root), None
+
+        if isinstance(primary_input, (bytes, bytearray, memoryview)):
+            return self._persist_primary_mesh_bytes(bytes(primary_input), output_root), None
+
+        raise ValidationError(
+            "The required mesh input must be provided as the primary mesh input or params.mesh_path.",
+            code="missing_mesh_input",
+            details={
+                "accepted_primary_inputs": [
+                    "path string with .glb/.obj/.stl/.ply suffix",
+                    "mapping containing mesh/path/file_path/filePath/local_path/workspace_path",
+                    "GLB bytes beginning with glTF magic",
+                    "base64-encoded GLB string beginning with glTF after decoding",
+                ],
+                "accepted_params": ["mesh_path", "mesh"],
+            },
+        )
+
     def load(self) -> "Hunyuan3DPartGenerator":
         self._shell_loaded = True
         return self
@@ -391,17 +504,16 @@ class Hunyuan3DPartGenerator(BaseGenerator):
             )
 
         resolved_image, resolved_params = self._normalize_generate_params(image_bytes, params, kwargs)
-        mesh_path = resolved_params.get("mesh_path")
-        if mesh_path is None:
-            raise ValidationError(
-                "The required secondary mesh input must be provided as params.mesh_path.",
-                code="missing_mesh_input",
-                details={"required_param": "mesh_path"},
-            )
+        output_root = self._output_root()
+        mesh_path, image_evidence_input = self._resolve_mesh_input(
+            resolved_image,
+            resolved_params,
+            output_root=output_root,
+        )
 
         validated_mesh = validate_mesh_path(mesh_path, search_roots=self._mesh_search_roots())
         normalized_params = normalize_params(resolved_params)
-        image_evidence = build_image_evidence(resolved_image)
+        image_evidence = build_image_evidence(image_evidence_input)
         readiness = self.readiness_status()
         blockers = self._collect_runtime_blockers(readiness)
 
@@ -422,11 +534,10 @@ class Hunyuan3DPartGenerator(BaseGenerator):
                     "mesh_path": str(validated_mesh.mesh_path),
                     "mesh_format": validated_mesh.mesh_format,
                     "params": normalized_params.to_dict(),
-                    "image_input_present": resolved_image is not None,
+                    "image_input_present": image_evidence_input is not None,
                     "shell_loaded": self._shell_loaded,
                 },
             )
-        output_root = Path(getattr(self, "outputs_dir", None) or self.runtime_context.paths.artifacts_root)
         result = decompose_mesh(
             {"mesh": validated_mesh.mesh_path},
             resolved_params,
