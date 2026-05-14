@@ -20,9 +20,9 @@ The extension is an integration layer for Modly. It is not a standalone redistri
 
 ## Support status
 
-- **Linux NVIDIA:** validated locally for the current adapter/runtime path. Recent local validation reported `214 passed, 12 subtests passed` after Windows-readiness promotion.
-- **Windows:** setup and readiness metadata are compatible and fail closed. Full Windows NVIDIA inference is **not** advertised until CUDA, native dependency, runtime, and weight probes pass on a real target host.
-- **Linux ARM64:** experimental and locally validated in limited conditions, with elevated native dependency risk. Treat this path as platform-sensitive until reproduced on the target environment.
+- **Linux ARM64:** full pipeline compatibility has been validated for the current adapter/runtime path.
+- **Windows:** P3-SAM segmentation has been validated. X-Part generation and the full chained pipeline have not been validated on Windows.
+- **Other Linux NVIDIA hosts:** expected to follow the Linux runtime path, but should be validated on the target environment before being treated as production-ready.
 
 ## Usage in Modly
 
