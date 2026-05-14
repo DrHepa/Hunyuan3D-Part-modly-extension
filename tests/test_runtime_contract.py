@@ -372,7 +372,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(limits["bbox_point_count"], 8192)
         self.assertEqual(limits["total_bbox_point_budget"], 65536)
 
-    def test_x_part_adapter_preserves_linux_limits_and_applies_windows_8gb_safe_policy(self) -> None:
+    def test_x_part_adapter_preserves_linux_limits_and_applies_windows_low_vram_policy(self) -> None:
         params = normalize_params({"pipeline_stage": "x-part", "quality_preset": "balanced", "max_parts": 5})
 
         linux_limits = resolve_adapter_x_part_resource_limits(params, host_os_name="linux")
@@ -384,17 +384,19 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(linux_limits["num_chunks"], 12000)
         self.assertEqual(linux_limits["surface_point_count"], 8192)
         self.assertEqual(linux_limits["bbox_point_count"], 8192)
-        self.assertEqual(windows_limits["platform_policy"], "windows_8gb_safe")
+        self.assertEqual(windows_limits["platform_policy"], "windows_low_vram_safe")
         self.assertEqual(windows_limits["requested_quality_preset"], "balanced")
         self.assertEqual(windows_limits["effective_quality_preset"], "fast")
-        self.assertEqual(windows_limits["effective_max_parts"], 5)
-        self.assertEqual(windows_limits["num_inference_steps"], 10)
-        self.assertEqual(windows_limits["octree_resolution"], 256)
-        self.assertLessEqual(windows_limits["num_chunks"], 8000)
-        self.assertLessEqual(windows_limits["surface_point_count"], 4096)
-        self.assertLessEqual(windows_limits["bbox_point_count"], 4096)
-        self.assertEqual(windows_limits["total_bbox_point_budget"], 16384)
-        self.assertEqual(windows_limits["min_bbox_point_count"], 2048)
+        self.assertEqual(windows_limits["requested_effective_max_parts"], 5)
+        self.assertEqual(windows_limits["windows_effective_max_parts_cap"], 3)
+        self.assertEqual(windows_limits["effective_max_parts"], 3)
+        self.assertEqual(windows_limits["num_inference_steps"], 6)
+        self.assertEqual(windows_limits["octree_resolution"], 192)
+        self.assertLessEqual(windows_limits["num_chunks"], 4096)
+        self.assertLessEqual(windows_limits["surface_point_count"], 1024)
+        self.assertLessEqual(windows_limits["bbox_point_count"], 1024)
+        self.assertEqual(windows_limits["total_bbox_point_budget"], 4096)
+        self.assertEqual(windows_limits["min_bbox_point_count"], 512)
         self.assertEqual(windows_limits["torch_dtype"], "float16")
 
     def test_x_part_resource_limits_fail_closed_above_hard_part_cap(self) -> None:
@@ -1212,13 +1214,16 @@ class RuntimeContractTests(unittest.TestCase):
             host_os_name="windows",
         )
 
-        self.assertIn("'platform_policy': 'windows_8gb_safe'", script)
+        self.assertIn("'platform_policy': 'windows_low_vram_safe'", script)
         self.assertIn("'requested_quality_preset': 'balanced'", script)
         self.assertIn("'effective_quality_preset': 'fast'", script)
-        self.assertIn("'num_inference_steps': 10", script)
-        self.assertIn("'octree_resolution': 256", script)
-        self.assertIn("'num_chunks': 8000", script)
-        self.assertIn("'surface_point_count': 4096", script)
+        self.assertIn("'requested_effective_max_parts': 5", script)
+        self.assertIn("'windows_effective_max_parts_cap': 3", script)
+        self.assertIn("'effective_max_parts': 3", script)
+        self.assertIn("'num_inference_steps': 6", script)
+        self.assertIn("'octree_resolution': 192", script)
+        self.assertIn("'num_chunks': 4096", script)
+        self.assertIn("'surface_point_count': 1024", script)
         self.assertIn("'torch_dtype': 'float16'", script)
 
     def test_x_part_adapter_fails_closed_when_bundle_is_missing(self) -> None:
@@ -1415,8 +1420,14 @@ class RuntimeContractTests(unittest.TestCase):
                         "surface_point_count": 8192,
                         "bbox_point_count": 8192,
                         "torch_dtype": "float32",
-                        "last_memory_stage": "after_partgen_import",
-                        "memory_trace": [{"stage": "after_partgen_import"}],
+                        "last_memory_stage": "after_sample_bbox_points",
+                        "memory_trace": [
+                            {
+                                "stage": "after_sample_bbox_points",
+                                "torch_cuda_allocated_gib": 8.511,
+                                "torch_cuda_reserved_gib": 8.604,
+                            }
+                        ],
                     }
                 )
                 + "\n",
@@ -1444,14 +1455,15 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertIn("resource_limits_json", ctx.exception.message)
         self.assertIn("partial stderr", ctx.exception.message)
         self.assertIn("partial stdout", ctx.exception.message)
-        self.assertIn("Last memory stage: after_partgen_import", ctx.exception.message)
+        self.assertIn("Last memory stage: after_sample_bbox_points", ctx.exception.message)
+        self.assertIn("X-Part is over low-VRAM budget", ctx.exception.message)
         diagnostics = ctx.exception.details["diagnostics"]
         failure_payload = json.loads(Path(diagnostics["failure"]).read_text(encoding="utf-8"))
         self.assertTrue(failure_payload["timed_out"])
         self.assertEqual(failure_payload["returncode"], -9)
         self.assertIn("partial stdout", failure_payload["stdout_tail"])
         self.assertIn("partial stderr", failure_payload["stderr_tail"])
-        self.assertEqual(failure_payload["resource_limits_payload"]["last_memory_stage"], "after_partgen_import")
+        self.assertEqual(failure_payload["resource_limits_payload"]["last_memory_stage"], "after_sample_bbox_points")
         self.assertIn("partial stdout", Path(diagnostics["stdout"]).read_text(encoding="utf-8"))
         self.assertIn("timed out", Path(diagnostics["stderr"]).read_text(encoding="utf-8"))
 

@@ -33,14 +33,15 @@ DEFAULT_X_PART_MIN_AVAILABLE_MEMORY_GIB = 16.0
 X_PART_MEMORY_GUARD_POLL_SECONDS = 1.0
 X_PART_DIAGNOSTIC_TAIL_CHARS = 4000
 X_PART_DIAGNOSTIC_TAIL_LINES = 80
-WINDOWS_8GB_SAFE_X_PART_LIMITS = {
-    "num_inference_steps": 10,
-    "octree_resolution": 256,
-    "num_chunks": 8000,
-    "surface_point_count": 4096,
-    "requested_bbox_point_count": 4096,
-    "total_bbox_point_budget": 16384,
-    "min_bbox_point_count": 2048,
+WINDOWS_LOW_VRAM_X_PART_LIMITS = {
+    "num_inference_steps": 6,
+    "octree_resolution": 192,
+    "num_chunks": 4096,
+    "surface_point_count": 1024,
+    "requested_bbox_point_count": 1024,
+    "total_bbox_point_budget": 4096,
+    "min_bbox_point_count": 512,
+    "effective_max_parts_cap": 3,
     "torch_dtype": "float16",
 }
 
@@ -207,7 +208,7 @@ def resolve_adapter_x_part_resource_limits(params: NormalizedParams, *, host_os_
     """Return X-Part limits adapted for the concrete adapter host.
 
     The global config resolver remains the Linux/default contract.  Windows gets
-    an adapter-only 8GB-safe policy because the managed X-Part subprocess has a
+    an adapter-only low-VRAM policy because the managed X-Part subprocess has a
     weaker memory guard there when ``/proc`` is unavailable and ``psutil`` is not
     installed.
     """
@@ -220,29 +221,34 @@ def resolve_adapter_x_part_resource_limits(params: NormalizedParams, *, host_os_
     if (host_os_name or "").lower() != "windows":
         return limits
 
-    effective_max_parts = int(limits["effective_max_parts"])
-    requested_bbox_point_count = min(int(limits.get("requested_bbox_point_count", limits.get("bbox_point_count", 4096))), int(WINDOWS_8GB_SAFE_X_PART_LIMITS["requested_bbox_point_count"]))
-    total_bbox_point_budget = int(WINDOWS_8GB_SAFE_X_PART_LIMITS["total_bbox_point_budget"])
-    min_bbox_point_count = int(WINDOWS_8GB_SAFE_X_PART_LIMITS["min_bbox_point_count"])
+    requested_effective_max_parts = int(limits["effective_max_parts"])
+    windows_effective_max_parts_cap = int(WINDOWS_LOW_VRAM_X_PART_LIMITS["effective_max_parts_cap"])
+    effective_max_parts = min(requested_effective_max_parts, windows_effective_max_parts_cap)
+    requested_bbox_point_count = min(int(limits.get("requested_bbox_point_count", limits.get("bbox_point_count", 4096))), int(WINDOWS_LOW_VRAM_X_PART_LIMITS["requested_bbox_point_count"]))
+    total_bbox_point_budget = int(WINDOWS_LOW_VRAM_X_PART_LIMITS["total_bbox_point_budget"])
+    min_bbox_point_count = int(WINDOWS_LOW_VRAM_X_PART_LIMITS["min_bbox_point_count"])
     adaptive_bbox_point_count = min(
         requested_bbox_point_count,
         max(min_bbox_point_count, total_bbox_point_budget // max(1, effective_max_parts)),
     )
     limits.update(
         {
-            "platform_policy": "windows_8gb_safe",
+            "platform_policy": "windows_low_vram_safe",
             "requested_quality_preset": requested_quality_preset,
             "effective_quality_preset": "fast",
             "quality_preset": requested_quality_preset,
-            "num_inference_steps": int(WINDOWS_8GB_SAFE_X_PART_LIMITS["num_inference_steps"]),
-            "octree_resolution": int(WINDOWS_8GB_SAFE_X_PART_LIMITS["octree_resolution"]),
-            "num_chunks": min(int(limits.get("num_chunks", WINDOWS_8GB_SAFE_X_PART_LIMITS["num_chunks"])), int(WINDOWS_8GB_SAFE_X_PART_LIMITS["num_chunks"])),
-            "surface_point_count": min(int(limits.get("surface_point_count", WINDOWS_8GB_SAFE_X_PART_LIMITS["surface_point_count"])), int(WINDOWS_8GB_SAFE_X_PART_LIMITS["surface_point_count"])),
+            "requested_effective_max_parts": requested_effective_max_parts,
+            "windows_effective_max_parts_cap": windows_effective_max_parts_cap,
+            "effective_max_parts": effective_max_parts,
+            "num_inference_steps": int(WINDOWS_LOW_VRAM_X_PART_LIMITS["num_inference_steps"]),
+            "octree_resolution": int(WINDOWS_LOW_VRAM_X_PART_LIMITS["octree_resolution"]),
+            "num_chunks": min(int(limits.get("num_chunks", WINDOWS_LOW_VRAM_X_PART_LIMITS["num_chunks"])), int(WINDOWS_LOW_VRAM_X_PART_LIMITS["num_chunks"])),
+            "surface_point_count": min(int(limits.get("surface_point_count", WINDOWS_LOW_VRAM_X_PART_LIMITS["surface_point_count"])), int(WINDOWS_LOW_VRAM_X_PART_LIMITS["surface_point_count"])),
             "requested_bbox_point_count": requested_bbox_point_count,
             "bbox_point_count": adaptive_bbox_point_count,
             "total_bbox_point_budget": total_bbox_point_budget,
             "min_bbox_point_count": min_bbox_point_count,
-            "point_budget_policy": "windows_8gb_safe_cap_total_bbox_points_by_effective_max_parts",
+            "point_budget_policy": "windows_low_vram_cap_total_bbox_points_by_effective_max_parts",
             "torch_dtype": "float16",
         }
     )
@@ -326,6 +332,8 @@ def _resource_limits_summary(resource_limits: Mapping[str, object] | None) -> di
     if not resource_limits:
         return {}
     keys = (
+        "requested_effective_max_parts",
+        "windows_effective_max_parts_cap",
         "effective_max_parts",
         "max_parts_hard_cap",
         "quality_preset",
@@ -356,6 +364,18 @@ def _last_memory_event(resource_limits: Mapping[str, object] | None) -> dict[str
 
 def _format_resource_summary(summary: Mapping[str, object]) -> str:
     return ", ".join(f"{key}={value}" for key, value in summary.items())
+
+
+def _is_low_vram_budget_pressure(last_memory_event: Mapping[str, object] | None) -> bool:
+    if not last_memory_event:
+        return False
+    for key in ("torch_cuda_allocated_gib", "torch_cuda_reserved_gib"):
+        try:
+            if float(last_memory_event.get(key, 0.0)) >= 7.75:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def _format_failure_message(
@@ -393,6 +413,8 @@ def _format_failure_message(
         lines.append(f"Last memory stage: {last_memory_stage}")
     if last_memory_event:
         lines.append(f"Last memory event: {json.dumps(dict(last_memory_event), sort_keys=True)}")
+        if _is_low_vram_budget_pressure(last_memory_event):
+            lines.append("Hint: X-Part is over low-VRAM budget; reduce max_parts/quality or use P3-SAM stage.")
     artifact_list = list(existing_artifacts)
     if artifact_list:
         lines.extend(["Existing artifacts:", *[f"- {path}" for path in artifact_list]])
