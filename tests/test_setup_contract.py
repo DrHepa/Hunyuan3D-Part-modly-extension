@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import runpy
 import sys
 import tempfile
 import unittest
@@ -25,6 +27,60 @@ class SetupContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.setup = load_setup_module()
+
+    def test_setup_runpy_loads_from_foreign_cwd(self) -> None:
+        class SetupBoundaryReached(RuntimeError):
+            pass
+
+        setup_path = ROOT / "setup.py"
+        original_cwd = Path.cwd()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            foreign_cwd = Path(temp_dir)
+            extension_dir = foreign_cwd / "installed-extension"
+            argv = [
+                str(setup_path),
+                json.dumps(
+                    {
+                        "python_exe": sys.executable,
+                        "ext_dir": str(extension_dir),
+                        "gpu_sm": 0,
+                        "cuda_version": 0,
+                    }
+                ),
+            ]
+
+            try:
+                os.chdir(foreign_cwd)
+                clean_sys_path = [
+                    entry
+                    for entry in sys.path
+                    if Path(entry or ".").resolve() not in {ROOT, ROOT / "src"}
+                ]
+                self.assertNotIn(ROOT, {Path(entry or ".").resolve() for entry in clean_sys_path})
+
+                with (
+                    mock.patch.dict(sys.modules),
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(sys, "path", clean_sys_path),
+                    mock.patch(
+                        "subprocess.run",
+                        side_effect=SetupBoundaryReached("managed setup boundary reached"),
+                    ) as run_mock,
+                ):
+                    for module_name in list(sys.modules):
+                        if module_name == "generator" or module_name == "runtime" or module_name.startswith("runtime."):
+                            sys.modules.pop(module_name)
+
+                    with self.assertRaisesRegex(SetupBoundaryReached, "managed setup boundary reached"):
+                        runpy.run_path(str(setup_path), run_name="__main__")
+
+                run_mock.assert_called_once_with(
+                    [sys.executable, "-m", "venv", str(extension_dir / "venv")],
+                    check=True,
+                )
+            finally:
+                os.chdir(original_cwd)
 
     def _create_fake_cumm_layout(self, root: Path) -> tuple[Path, Path, Path, Path, Path]:
         venv_dir = root / "venv"
