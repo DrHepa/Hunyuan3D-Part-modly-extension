@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import runpy
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1223,6 +1225,58 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
         self.assertIn("diffusers", self.setup.RUNTIME_PACKAGES)
         self.assertIn("einops", self.setup.RUNTIME_PACKAGES)
         self.assertIn("pymeshlab", self.setup.RUNTIME_PACKAGES)
+
+    def test_fpsample_uses_an_exact_wheel_only_requirement(self) -> None:
+        self.assertEqual(self.setup.FPSAMPLE_REQUIREMENT, "fpsample==0.3.3")
+        self.assertNotIn("fpsample", self.setup.RUNTIME_PACKAGES)
+        self.assertIn("fpsample", self.setup.VERIFY_IMPORTS)
+
+    def test_install_fpsample_wheel_uses_managed_python_without_source_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            venv_dir = Path(temp_dir) / "venv"
+            expected_python = venv_dir / "Scripts" / "python.exe"
+
+            with (
+                mock.patch.object(self.setup.platform, "system", return_value="Windows"),
+                mock.patch.object(self.setup.subprocess, "run") as run_mock,
+            ):
+                first = self.setup.install_fpsample_wheel(venv_dir)
+                second = self.setup.install_fpsample_wheel(venv_dir)
+
+        expected_command = [
+            str(expected_python),
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "--only-binary",
+            ":all:",
+            "fpsample==0.3.3",
+        ]
+        self.assertEqual(run_mock.call_args_list, [mock.call(expected_command, check=True)] * 2)
+        self.assertEqual(first["status"], "installed")
+        self.assertEqual(second["status"], "installed")
+        self.assertTrue(first["binary_only"])
+
+    def test_install_fpsample_wheel_returns_actionable_failure_without_compiler_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            venv_dir = Path(temp_dir) / "venv"
+            failure = subprocess.CalledProcessError(returncode=1, cmd=["pip", "install"])
+
+            with mock.patch.object(self.setup, "pip_install", side_effect=failure):
+                result = self.setup.install_fpsample_wheel(venv_dir)
+
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["requirement"], "fpsample==0.3.3")
+        self.assertIn("Wheel-only installation", result["message"])
+        self.assertIn("CMake/MSVC", result["message"])
+        self.assertIn("package index", result["message"])
+        self.assertIn("network", result["message"])
+        self.assertIn("certificate", result["message"])
+        self.assertIn("permission", result["message"])
+        self.assertIn("compatible wheel", result["message"])
+        self.assertIn("Repair", result["next_action"])
 
     def test_build_readiness_report_marks_missing_venv_pending(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4418,7 +4472,16 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
 
         self.assertEqual(exit_code, 0)
         self.assertGreaterEqual(run_mock.call_count, 1)
-        self.assertGreaterEqual(pip_install_mock.call_count, 3)
+        self.assertGreaterEqual(pip_install_mock.call_count, 4)
+        managed_venv = extension_dir / "venv"
+        self.assertEqual(
+            pip_install_mock.call_args_list[2],
+            mock.call(managed_venv, "--only-binary", ":all:", "fpsample==0.3.3"),
+        )
+        self.assertEqual(
+            pip_install_mock.call_args_list[3],
+            mock.call(managed_venv, *self.setup.RUNTIME_PACKAGES),
+        )
         self.assertEqual(summary["status"], "ready")
         self.assertEqual(summary["torch_target"], "linux-arm64-cu128")
         self.assertEqual(summary["native_mode"], "auto")
@@ -4438,6 +4501,49 @@ template <> struct numeric_limits<tv::bfloat16_t> {};
         self.assertIn("diffusers", summary["runtime_packages"])
         self.assertIn("einops", summary["runtime_packages"])
         self.assertIn("pymeshlab", summary["runtime_packages"])
+        self.assertIn("fpsample==0.3.3", summary["runtime_packages"])
+        self.assertNotIn("fpsample", summary["bulk_runtime_packages"])
+        self.assertEqual(summary["fpsample_install"]["status"], "installed")
+
+    def test_run_setup_writes_actionable_summary_when_fpsample_wheel_only_install_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            extension_dir = Path(temp_dir)
+
+            def fail_only_fpsample(venv_dir: Path, *packages: str, **kwargs: object) -> None:
+                del venv_dir, kwargs
+                if "fpsample==0.3.3" in packages:
+                    raise subprocess.CalledProcessError(returncode=1, cmd=["pip", "install", *packages])
+
+            with (
+                mock.patch.object(self.setup.subprocess, "run"),
+                mock.patch.object(self.setup, "pip_install", side_effect=fail_only_fpsample),
+                mock.patch.object(self.setup, "python_tag", return_value="cp311"),
+                mock.patch.object(self.setup, "_platform_facts", return_value=("Windows", "AMD64")),
+                mock.patch.object(self.setup, "prepare_upstream_runtime_source") as prepare_mock,
+                mock.patch.object(self.setup, "run_native_runtime_phase") as native_mock,
+                mock.patch.object(self.setup, "build_readiness_report") as readiness_mock,
+                mock.patch.object(self.setup.sys, "stderr", new_callable=io.StringIO) as stderr,
+            ):
+                exit_code = self.setup.run_setup(
+                    [json.dumps({"python_exe": "python.exe", "ext_dir": str(extension_dir), "gpu_sm": 89, "cuda_version": 124})],
+                    as_json=False,
+                )
+                summary = json.loads((extension_dir / ".modly-setup-summary.json").read_text(encoding="utf-8"))
+                stderr_output = stderr.getvalue()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["status"], "failed")
+        self.assertFalse(summary["prepared_shell"])
+        self.assertEqual(summary["failure_phase"], "runtime-dependencies")
+        self.assertEqual(summary["fpsample_install"]["requirement"], "fpsample==0.3.3")
+        self.assertTrue(summary["fpsample_install"]["binary_only"])
+        self.assertIn("CMake/MSVC", summary["blocked_reasons"][0])
+        self.assertIn("Repair", summary["next_action"])
+        self.assertIn(summary["next_action"], stderr_output)
+        self.assertIn(str(extension_dir / ".modly-setup-summary.json"), stderr_output)
+        prepare_mock.assert_not_called()
+        native_mock.assert_not_called()
+        readiness_mock.assert_not_called()
 
     def test_run_setup_summary_keeps_native_success_when_only_weights_are_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

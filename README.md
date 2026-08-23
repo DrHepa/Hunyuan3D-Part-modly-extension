@@ -18,19 +18,23 @@ The extension is an integration layer for Modly. It is not a standalone redistri
 - Upstream Hunyuan3D-Part weights and assets from `tencent/Hunyuan3D-Part`.
 - Sufficient GPU memory for the selected pipeline and quality preset. The manifest currently declares a 24 GB VRAM target.
 
-## Support status
+## Compatibility and support status
 
 - **Linux ARM64:** full pipeline compatibility has been validated for the current adapter/runtime path.
 - **Windows:** P3-SAM segmentation has been validated. X-Part generation and the full chained pipeline have not been validated on Windows.
 - **Other Linux NVIDIA hosts:** expected to follow the Linux runtime path, but should be validated on the target environment before being treated as production-ready.
 
-## Usage in Modly
+The managed setup pins `fpsample==0.3.3` and accepts a prebuilt wheel only. On Modly's supported CPython 3.11/3.12 runtimes, updating the extension and running Repair should not require users to install CMake or MSVC for `fpsample`. Linux ARM64 still has separate native CUDA dependencies that may require the platform's native compiler and toolkit; the `fpsample` wheel fix does not remove those requirements.
 
-Install or add this extension from GitHub or from a local checkout using the Modly UI flow for extensions. The manifest source is:
+## Installation
+
+In Modly, open **Models/Extensions → Install from GitHub** and use this repository URL. A local checkout can also be added through Modly's extension UI. The manifest source is:
 
 ```text
 https://github.com/DrHepa/Hunyuan3D-Part-modly-extension
 ```
+
+## Usage in Modly
 
 After the extension is added, use Modly's managed setup flow to prepare the Python environment and dependencies. Real inference requires the upstream assets and a CUDA-ready host.
 
@@ -88,6 +92,14 @@ python setup.py readiness --json
 ```
 
 These commands report whether the host, CUDA visibility, native dependencies, adapter imports, and weights are ready. The readiness contract is fail-closed: if required platform/runtime conditions are missing, inference should not be treated as available.
+
+## Troubleshooting
+
+### `fpsample` or CMake setup errors
+
+If an older installation reports a CMake configuration error while installing `fpsample`, update the extension and run Repair again. The current setup installs the pinned `fpsample==0.3.3` wheel before the remaining runtime packages and disables source fallback, so installing CMake or MSVC manually is not the fix.
+
+If the wheel-only installation fails, setup stops with an explicit diagnostic instead of attempting a local compile. Causes can include an incompatible wheel or package-index, network, certificate, or permission problems. Check that access first, confirm that Modly is using CPython 3.11 or 3.12, update Modly and the extension, and retry Repair; if it still fails, report the pip error, OS, architecture, and managed Python version.
 
 ## Local testing
 

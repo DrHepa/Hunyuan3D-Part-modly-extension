@@ -39,6 +39,9 @@ NATIVE_BUILD_ARTIFACTS_DIRNAME = ".modly/native-build-artifacts"
 TORCH_SCATTER_VERSION = "2.1.2"
 TORCH_CLUSTER_VERSION = "1.6.3"
 WINDOWS_SPCONV_VERSION = "2.3.8"
+FPSAMPLE_VERSION = "0.3.3"
+FPSAMPLE_REQUIREMENT = f"fpsample=={FPSAMPLE_VERSION}"
+FPSAMPLE_BINARY_POLICY = ":all:"
 WINDOWS_SPCONV_PACKAGES_BY_CUDA_LABEL = {
     "cu118": f"spconv-cu118=={WINDOWS_SPCONV_VERSION}",
     "cu124": f"spconv-cu124=={WINDOWS_SPCONV_VERSION}",
@@ -73,7 +76,6 @@ RUNTIME_PACKAGES = [
     "scikit-image",
     "scikit-learn",
     "tqdm",
-    "fpsample",
     "numba",
     "viser",
     "gradio",
@@ -802,6 +804,54 @@ def pip_install(venv_dir: Path, *packages: str, index_url: str | None = None, ex
         command.extend(["--extra-index-url", extra_index_url])
     command.extend(packages)
     pip_run(venv_dir, *command)
+
+
+def install_fpsample_wheel(venv_dir: Path) -> dict[str, Any]:
+    """Install the known wheel-backed fpsample release without compiling fallback."""
+
+    install_args = ("--only-binary", FPSAMPLE_BINARY_POLICY, FPSAMPLE_REQUIREMENT)
+    command = subprocess_command(
+        venv_python(venv_dir),
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        *install_args,
+    )
+    result: dict[str, Any] = {
+        "requirement": FPSAMPLE_REQUIREMENT,
+        "binary_only": True,
+        "source_fallback": False,
+        "command": command,
+    }
+    try:
+        pip_install(venv_dir, *install_args)
+    except subprocess.CalledProcessError as exc:
+        message = (
+            f"Wheel-only installation of {FPSAMPLE_REQUIREMENT} failed; setup will not fall back to a "
+            "CMake/MSVC source build. Possible causes include an incompatible wheel or package index, network, "
+            "certificate, or permission problems."
+        )
+        next_action = (
+            "Check package-index/network/certificate access and permissions, confirm Modly uses CPython 3.11 or "
+            "3.12, then update the extension and run Repair. If it still fails, report the pip error with the OS, "
+            "architecture, and managed Python version."
+        )
+        return {
+            **result,
+            "ready": False,
+            "status": "failed",
+            "returncode": exc.returncode,
+            "message": message,
+            "next_action": next_action,
+        }
+    return {
+        **result,
+        "ready": True,
+        "status": "installed",
+        "message": f"Installed {FPSAMPLE_REQUIREMENT} from a prebuilt wheel without source fallback.",
+        "next_action": "None. The fpsample wheel dependency is ready.",
+    }
 
 
 def _native_build_artifact_root(extension_dir: Path) -> Path:
@@ -4782,6 +4832,40 @@ def run_setup(argv: list[str], *, as_json: bool) -> int:
         index_url=torch_plan.get("index_url"),
         extra_index_url=torch_plan.get("extra_index_url"),
     )
+    fpsample_install = install_fpsample_wheel(venv_dir)
+    if not fpsample_install["ready"]:
+        failure_summary = {
+            "status": "failed",
+            "prepared_shell": False,
+            "failure_phase": "runtime-dependencies",
+            "setup_contract": "python-root-setup-py",
+            "surface_owner": "electron",
+            "extension_dir": str(extension_dir),
+            "python_exe": source_python,
+            "venv_python": str(venv_python(venv_dir)),
+            "gpu_sm": gpu_sm,
+            "cuda_version": cuda_version,
+            "gpu_detection": gpu_runtime_details,
+            "native_mode": native_mode,
+            "torch_target": torch_plan["target"],
+            "torch_packages": torch_plan["packages"],
+            "runtime_packages": [FPSAMPLE_REQUIREMENT, *RUNTIME_PACKAGES],
+            "bulk_runtime_packages": list(RUNTIME_PACKAGES),
+            "fpsample_install": fpsample_install,
+            "blocked_reasons": [fpsample_install["message"]],
+            "next_action": fpsample_install["next_action"],
+        }
+        summary_path = _write_summary(failure_summary, extension_dir)
+        if as_json:
+            print(json.dumps(failure_summary, indent=2, sort_keys=True))
+        else:
+            print(
+                f"error: {fpsample_install['message']}\n"
+                f"next action: {fpsample_install['next_action']}\n"
+                f"details: {summary_path}",
+                file=sys.stderr,
+            )
+        return 1
     pip_install(venv_dir, *RUNTIME_PACKAGES)
     upstream_runtime = prepare_upstream_runtime_source(extension_dir)
     native_runtime = run_native_runtime_phase(
@@ -4825,7 +4909,9 @@ def run_setup(argv: list[str], *, as_json: bool) -> int:
         "install_strategy": native_runtime.get("install_strategy", "unsupported"),
         "torch_target": torch_plan["target"],
         "torch_packages": torch_plan["packages"],
-        "runtime_packages": list(RUNTIME_PACKAGES),
+        "runtime_packages": [FPSAMPLE_REQUIREMENT, *RUNTIME_PACKAGES],
+        "bulk_runtime_packages": list(RUNTIME_PACKAGES),
+        "fpsample_install": fpsample_install,
         "base_runtime": readiness["base_runtime"],
         "upstream_runtime": upstream_runtime,
         "native_runtime": native_runtime,
