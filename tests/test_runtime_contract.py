@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1488,6 +1489,62 @@ class RuntimeContractTests(unittest.TestCase):
 
         self.assertTrue(guard and guard["triggered"])
         self.assertIn("memory guard terminated", result.stderr.lower())
+
+    def test_x_part_memory_guard_drains_large_stdout_and_stderr_without_deadlock(self) -> None:
+        chunk_size = 32 * 1024
+        chunk_count = 4
+        expected_stdout = "".join(f"OUT-{index}-" + ("O" * chunk_size) + "\n" for index in range(chunk_count))
+        expected_stderr = "".join(f"ERR-{index}-" + ("E" * chunk_size) + "\n" for index in range(chunk_count))
+        child_script = (
+            "import sys\n"
+            f"chunk_size = {chunk_size}\n"
+            f"chunk_count = {chunk_count}\n"
+            "for index in range(chunk_count):\n"
+            "    sys.stdout.write(f'OUT-{index}-' + ('O' * chunk_size) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "    sys.stderr.write(f'ERR-{index}-' + ('E' * chunk_size) + '\\n')\n"
+            "    sys.stderr.flush()\n"
+        )
+
+        with mock.patch("runtime.x_part._read_mem_available_gib", return_value=128.0):
+            result, guard = _run_with_memory_guard(
+                [sys.executable, "-c", child_script],
+                cwd=str(self.workspace),
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                timeout_seconds=10,
+                min_available_gib=16.0,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, expected_stdout)
+        self.assertEqual(result.stderr, expected_stderr)
+        self.assertFalse(guard and guard["triggered"])
+
+    def test_x_part_memory_guard_timeout_captures_output_and_joins_readers(self) -> None:
+        child_script = (
+            "import sys, time\n"
+            "sys.stdout.write('stdout-before-timeout\\n')\n"
+            "sys.stdout.flush()\n"
+            "sys.stderr.write('stderr-before-timeout\\n')\n"
+            "sys.stderr.flush()\n"
+            "time.sleep(30)\n"
+        )
+
+        with (
+            mock.patch("runtime.x_part._read_mem_available_gib", return_value=128.0),
+            self.assertRaises(subprocess.TimeoutExpired) as ctx,
+        ):
+            _run_with_memory_guard(
+                [sys.executable, "-c", child_script],
+                cwd=str(self.workspace),
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                timeout_seconds=0.1,
+                min_available_gib=16.0,
+            )
+
+        self.assertIn("stdout-before-timeout", ctx.exception.output)
+        self.assertIn("stderr-before-timeout", ctx.exception.stderr)
+        self.assertFalse(any(thread.name.startswith("x-part-") for thread in threading.enumerate()))
 
     def test_full_stage_chains_p3_sam_aabb_into_x_part(self) -> None:
         plan = build_execution_plan(

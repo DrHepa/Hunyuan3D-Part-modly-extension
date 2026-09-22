@@ -40,34 +40,42 @@ class ManifestContractTests(unittest.TestCase):
         self.assertEqual(metadata["hf_repo"], "tencent/Hunyuan3D-Part")
         self.assertEqual(metadata["download_check"], "p3sam/p3sam.safetensors")
         self.assertEqual(metadata["weight_owner_id"], "p3sam")
-        self.assertIn("Single mesh-primary node", metadata["workflow_constraint"])
-        self.assertIn("not declared as a renderer input", metadata["workflow_constraint"])
+        self.assertIn("Primary workflow input must remain image", metadata["workflow_constraint"])
+        self.assertIn("required secondary named input", metadata["workflow_constraint"])
         self.assertEqual(metadata["windows_setup_readiness"], "compatible-for-setup-and-readiness-probes")
         self.assertTrue(metadata["windows_inference_requires_native_probe"])
         self.assertIn("full Windows NVIDIA inference is not advertised", metadata["public_release_readiness"])
         self.assertIn("fail-closed", metadata["inference_support_contract"])
 
-    def test_node_schema_uses_mesh_primary_with_required_mesh_contract(self) -> None:
+    def test_node_schema_uses_image_base_with_optional_front_and_required_mesh(self) -> None:
         self.assertEqual(len(self.manifest["nodes"]), 1)
         node = self.manifest["nodes"][0]
         self.assertEqual(node["id"], "decompose-mesh")
         self.assertEqual(node["name"], "Decompose Mesh")
-        self.assertEqual(node["input"], "mesh")
+        self.assertEqual(node["input"], "image")
         self.assertEqual(node["output"], "mesh")
         self.assertEqual(node["hf_repo"], "tencent/Hunyuan3D-Part")
         self.assertEqual(node["download_check"], "p3sam/p3sam.safetensors")
         self.assertEqual(node["weight_owner_id"], "p3sam")
-        self.assertEqual(node["input_mode"], "mesh-guided-decomposition")
-        self.assertEqual(node["inputs"], ["mesh"])
-        self.assertNotIn("outputs", node)
-        self.assertEqual(len(node["input_contract"]), 1)
-        self.assertEqual(node["input_contract"][0]["name"], "mesh")
-        self.assertEqual(node["input_contract"][0]["type"], "mesh")
-        self.assertTrue(node["input_contract"][0]["required"])
-        self.assertEqual(node["input_contract"][0]["formats"], ["glb", "obj", "stl", "ply"])
-        self.assertEqual(len(node["output_contract"]), 1)
-        self.assertTrue(node["output_contract"][0]["primary"])
-        self.assertEqual(node["output_contract"][0]["formats"], ["glb"])
+        self.assertEqual(node["input_mode"], "image-conditioned-mesh")
+        self.assertEqual([item["name"] for item in node["inputs"]], ["front", "mesh"])
+        self.assertEqual(node["inputs"][0], {
+            "name": "front",
+            "type": "image",
+            "required": False,
+            "formats": ["png", "jpg", "jpeg", "webp"],
+        })
+        self.assertEqual(node["inputs"][1], {
+            "name": "mesh",
+            "type": "mesh",
+            "required": True,
+            "formats": ["glb", "obj", "stl", "ply"],
+        })
+        self.assertEqual(len(node["outputs"]), 1)
+        self.assertTrue(node["outputs"][0]["primary"])
+        self.assertEqual(node["outputs"][0]["formats"], ["glb"])
+        self.assertNotIn("input_contract", node)
+        self.assertNotIn("output_contract", node)
         self.assertEqual(
             node["defaults"],
             {
@@ -93,14 +101,14 @@ class ManifestContractTests(unittest.TestCase):
         self.assertEqual(export_param["options"], [{"value": "glb", "label": "GLB"}])
         self.assertEqual(node["params"]["export_format"]["enum"], ["glb"])
 
-    def test_node_inputs_are_renderer_safe_strings(self) -> None:
+    def test_node_inputs_use_current_named_host_contract(self) -> None:
         node = self.manifest["nodes"][0]
 
-        self.assertEqual(node["inputs"], ["mesh"])
-        self.assertTrue(all(isinstance(item, str) for item in node["inputs"]))
-        self.assertNotIn("outputs", node)
-        self.assertIn("input_contract", node)
-        self.assertIn("output_contract", node)
+        self.assertEqual(node["input"], "image")
+        self.assertEqual([item["name"] for item in node["inputs"]], ["front", "mesh"])
+        self.assertFalse(node["inputs"][0]["required"])
+        self.assertTrue(node["inputs"][1]["required"])
+        self.assertEqual(node["outputs"][0]["name"], "mesh")
 
     def test_semantic_report_sidecar_is_statically_discoverable(self) -> None:
         node = self.manifest["nodes"][0]

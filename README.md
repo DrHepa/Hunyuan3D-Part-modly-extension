@@ -1,6 +1,6 @@
 # Hunyuan3D-Part Modly Extension
 
-Hunyuan3D-Part is a Modly model extension/adaptor for Tencent's Hunyuan3D-Part project. It exposes mesh-guided part decomposition in Modly through a managed model setup flow, using the upstream `tencent/Hunyuan3D-Part` assets and runtime components when they are available on the host.
+Hunyuan3D-Part is a Modly model extension/adaptor for Tencent's Hunyuan3D-Part project. It exposes image-conditioned, mesh-guided part decomposition in Modly through a managed model setup flow, using the upstream `tencent/Hunyuan3D-Part` assets and runtime components when they are available on the host.
 
 This repository contains the Modly extension metadata, setup/readiness integration, runtime adapter code, and local tests for that adapter.
 
@@ -44,11 +44,14 @@ This README intentionally does not claim a CLI/headless install path. Follow the
 
 The extension declares one model node:
 
-- `decompose-mesh` — decomposes a required input mesh. The manifest exposes this as a single mesh-primary renderer node; optional image evidence is runtime-only and is not declared as a renderer input.
+- `decompose-mesh` — decomposes a required input mesh using the image-based Modly generation route. The manifest declares `input: image`, an optional named `front` image-evidence port, and a required named `mesh` port.
 
 Inputs:
 
+- Base image input / `front` — image evidence used by the prepared workflow. Supported formats are `png`, `jpg`, `jpeg`, and `webp`.
 - `mesh` — required mesh input: `glb`, `obj`, `stl`, or `ply`.
+
+The prepared Modly workflow connects both the front image and the mesh, and that is the supported execution route. The named `front` port is optional in the manifest so the runtime can treat image evidence as optional metadata, but Modly currently dispatches this model through `/generate/from-image`, which still requires an image payload. A workflow containing only the mesh is therefore not a supported execution path.
 
 Output:
 

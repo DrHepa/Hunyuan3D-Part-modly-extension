@@ -6,9 +6,10 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, TextIO
 
 from .config import NormalizedParams, resolve_x_part_resource_limits
 from .errors import RuntimeFailure, SetupFailure
@@ -573,6 +574,47 @@ def _run_with_memory_guard(
         cwd=cwd,
         env=env,
     )
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    reader_errors: list[Exception] = []
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_pipe = process.stdout
+    stderr_pipe = process.stderr
+
+    def drain_stream(stream: TextIO, chunks: list[str]) -> None:
+        try:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    return
+                chunks.append(chunk)
+        except Exception as exc:  # pragma: no cover - defensive I/O boundary
+            reader_errors.append(exc)
+
+    readers = [
+        threading.Thread(target=drain_stream, args=(stdout_pipe, stdout_chunks), name="x-part-stdout-reader"),
+        threading.Thread(target=drain_stream, args=(stderr_pipe, stderr_chunks), name="x-part-stderr-reader"),
+    ]
+    for reader in readers:
+        reader.start()
+
+    def finish_process(*, terminate: bool = False) -> tuple[str, str]:
+        if terminate and process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=10 if terminate else None)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        for reader in readers:
+            reader.join()
+        stdout_pipe.close()
+        stderr_pipe.close()
+        if reader_errors:
+            raise reader_errors[0]
+        return "".join(stdout_chunks), "".join(stderr_chunks)
+
     started_at = time.monotonic()
     lowest_available_gib: float | None = None
     while process.poll() is None:
@@ -586,12 +628,7 @@ def _run_with_memory_guard(
         if available_gib is not None:
             lowest_available_gib = available_gib if lowest_available_gib is None else min(lowest_available_gib, available_gib)
             if min_available_gib > 0 and available_gib < min_available_gib:
-                process.terminate()
-                try:
-                    stdout, stderr = process.communicate(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    stdout, stderr = process.communicate()
+                stdout, stderr = finish_process(terminate=True)
                 message = (
                     f"\nX-Part memory guard terminated subprocess: MemAvailable={available_gib:.2f} GiB "
                     f"below threshold {min_available_gib:.2f} GiB.\n"
@@ -609,15 +646,10 @@ def _run_with_memory_guard(
                     },
                 )
         if time.monotonic() - started_at > timeout_seconds:
-            process.terminate()
-            try:
-                stdout, stderr = process.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate()
+            stdout, stderr = finish_process(terminate=True)
             raise subprocess.TimeoutExpired(command, timeout_seconds, output=stdout, stderr=stderr)
         time.sleep(X_PART_MEMORY_GUARD_POLL_SECONDS)
-    stdout, stderr = process.communicate()
+    stdout, stderr = finish_process()
     return (
         subprocess.CompletedProcess(command, process.returncode if process.returncode is not None else 0, stdout, stderr),
         {
